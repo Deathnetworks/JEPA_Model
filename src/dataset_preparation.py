@@ -40,6 +40,18 @@ def prepare_text_from_item(item, dataset_name):
             role = conv.get('from', '')
             value = conv.get('value', '')
             text += f"{role.capitalize()}: {value}\n\n"
+    elif dataset_name == "ise-uiuc/Magicoder-OSS-Instruct-75K":
+        problem = item.get('problem', '')
+        solution = item.get('solution', '')
+        text = f"System: You are an exceptionally intelligent coding assistant.\n\nUser: {problem}\n\nAssistant: {solution}"
+    elif dataset_name == "teknium/OpenHermes-2.5":
+        system = item.get('system_prompt', '')
+        text = f"System: {system}\n\n"
+        conversations = item.get('conversations', [])
+        for conv in conversations:
+            role = conv.get('from', '')
+            value = conv.get('value', '')
+            text += f"{role.capitalize()}: {value}\n\n"
     return text.strip()
 
 def process_and_save_datasets(
@@ -47,7 +59,7 @@ def process_and_save_datasets(
     save_dir=r"F:\JEPA_Model\data",
     seq_len=2048,
     chunk_size=5000,
-    max_samples_per_dataset=None
+    max_samples_per_dataset=20000
 ):
     device = setup_device()
 
@@ -68,7 +80,9 @@ def process_and_save_datasets(
 
     datasets_to_process = [
         "AlicanKiraz0/Agentic-Chain-of-Thought-Coding-SFT-Dataset",
-        "TheAgenticAI/Agentic-Reasoning"
+        "TheAgenticAI/Agentic-Reasoning",
+        "ise-uiuc/Magicoder-OSS-Instruct-75K",
+        "teknium/OpenHermes-2.5"
     ]
 
     for dataset_name in datasets_to_process:
@@ -118,8 +132,17 @@ def process_and_save_datasets(
             # Periodically write to disk
             if len(buffer) >= chunk_size:
                 tensor_chunk = torch.stack(buffer) # [chunk_size, seq_len]
-                safe_name = dataset_name.replace("/", "_")
-                out_file = save_path / f"{safe_name}_chunk_{file_index}.pt"
+
+                if dataset_name in ["AlicanKiraz0/Agentic-Chain-of-Thought-Coding-SFT-Dataset", "TheAgenticAI/Agentic-Reasoning"]:
+                    prefix = "agentic_"
+                elif dataset_name == "ise-uiuc/Magicoder-OSS-Instruct-75K":
+                    prefix = "logic_"
+                elif dataset_name == "teknium/OpenHermes-2.5":
+                    prefix = "creative_"
+                else:
+                    prefix = "unknown_"
+
+                out_file = save_path / f"{prefix}set_{file_index}.pt"
 
                 # We save locally as .pt which acts as a cache for standard DataLoader
                 torch.save(tensor_chunk, out_file)
@@ -131,8 +154,17 @@ def process_and_save_datasets(
         # Flush remaining buffer
         if buffer:
             tensor_chunk = torch.stack(buffer)
-            safe_name = dataset_name.replace("/", "_")
-            out_file = save_path / f"{safe_name}_chunk_{file_index}.pt"
+
+            if dataset_name in ["AlicanKiraz0/Agentic-Chain-of-Thought-Coding-SFT-Dataset", "TheAgenticAI/Agentic-Reasoning"]:
+                prefix = "agentic_"
+            elif dataset_name == "ise-uiuc/Magicoder-OSS-Instruct-75K":
+                prefix = "logic_"
+            elif dataset_name == "teknium/OpenHermes-2.5":
+                prefix = "creative_"
+            else:
+                prefix = "unknown_"
+
+            out_file = save_path / f"{prefix}set_{file_index}.pt"
             torch.save(tensor_chunk, out_file)
             logging.info(f"Saved final {out_file} with shape {tensor_chunk.shape}")
 
