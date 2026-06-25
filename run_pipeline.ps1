@@ -16,13 +16,17 @@ if (Test-Path ".env") {
     Write-Host "Hugging Face Authentication Token Loaded." -ForegroundColor Green
 }
 
-# 3. Explicitly link the LLVM Compiler to Triton
-$llvmPath = "C:\Program Files\LLVM\bin"
-$env:PATH = "$llvmPath;" + $env:PATH
-$env:CC = "$llvmPath\clang.exe"
-$env:CXX = "$llvmPath\clang++.exe"
+# 3. Explicitly link the Intel oneAPI SYCL Compiler to Triton
+# We use icpx.exe (Intel C++) because it natively handles SYCL and Windows /LIBPATH flags
+$intelCompilerPath = "C:\Program Files (x86)\Intel\oneAPI\compiler\2025.3\bin\compiler"
+$env:PATH = "$intelCompilerPath;" + $env:PATH
+$env:CC = "$intelCompilerPath\icx.exe"
+$env:CXX = "$intelCompilerPath\icpx.exe"
 
-Write-Host "Triton C++ Compiler forcefully mapped to: $env:CXX" -ForegroundColor Green
+# Optional safety net to strip aggressive Windows linker formats if they persist
+$env:LDFLAGS = " " 
+
+Write-Host "Triton SYCL Compiler forcefully mapped to Intel oneAPI: $env:CXX" -ForegroundColor Green
 
 # Check for Admin rights
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)

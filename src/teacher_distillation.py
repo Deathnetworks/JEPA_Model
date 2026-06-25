@@ -67,11 +67,16 @@ def main():
         else:
             teacher_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
-    # Load with 4-bit precision directly to the xpu
+    # Ensure the SSD offload directory exists
+    offload_dir = r"F:\JEPA_Model\offload_cache"
+    os.makedirs(offload_dir, exist_ok=True)
+
+    # Load with 4-bit precision and automatic SSD offloading
     teacher_model = AutoModelForCausalLM.from_pretrained(
         teacher_name,
         quantization_config=quantization_config,
-        device_map={"": "xpu"},
+        device_map="auto",                     # Changed from {"": "xpu"} to allow spilling
+        offload_folder=offload_dir,            # Explicitly route overflow to the SSD
         trust_remote_code=True
     )
     teacher_model.eval()
