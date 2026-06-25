@@ -2,30 +2,32 @@ $ErrorActionPreference = "Continue"
 
 Write-Host "Initializing Pipeline Environment..." -ForegroundColor Cyan
 
-# Force Hugging Face to cache everything on the F: drive
-$env:HF_HOME = "F:\JEPA_Model\hf_cache"
-Write-Host "Set Hugging Face Cache to: $env:HF_HOME" -ForegroundColor Green
+# 1. Clean the local PATH to prevent length overflow errors
+$env:PATH = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
-# Load Secrets from .env file
+# 2. Force HF Cache and load token
+$env:HF_HOME = "F:\JEPA_Model\hf_cache"
 if (Test-Path ".env") {
-    Write-Host "Loading secrets from .env..." -ForegroundColor Cyan
     Get-Content ".env" | ForEach-Object {
-        # Match lines that look like KEY=VALUE and ignore comments/blank lines
         if ($_ -match '^\s*([^#\s]+)\s*=\s*(.*)$') {
             [Environment]::SetEnvironmentVariable($matches[1], $matches[2])
         }
     }
     Write-Host "Hugging Face Authentication Token Loaded." -ForegroundColor Green
-} else {
-    Write-Host "WARNING: .env file not found. Hugging Face downloads might hit rate limits or fail." -ForegroundColor Yellow
 }
+
+# 3. Explicitly link the LLVM Compiler to Triton
+$llvmPath = "C:\Program Files\LLVM\bin"
+$env:PATH = "$llvmPath;" + $env:PATH
+$env:CC = "$llvmPath\clang.exe"
+$env:CXX = "$llvmPath\clang++.exe"
+
+Write-Host "Triton C++ Compiler forcefully mapped to: $env:CXX" -ForegroundColor Green
 
 # Check for Admin rights
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host "WARNING: Script is not running as Administrator. Some operations may fail." -ForegroundColor Yellow
-} else {
-    Write-Host "Confirmed: Running as Administrator." -ForegroundColor Green
 }
 
 # Activate virtual environment
