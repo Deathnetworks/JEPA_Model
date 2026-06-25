@@ -1,3 +1,6 @@
+# Secrets
+.env
+
 # Virtual environment
 venv/
 .venv/
@@ -16,3 +19,4 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+/hf_cache
