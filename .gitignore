@@ -1,0 +1,18 @@
+# Virtual environment
+venv/
+.venv/
+
+# Local cache and binary data matrices
+data/
+*.pt
+*.bin
+*.pkl
+
+# Python system artifacts
+__pycache__/
+*.pyc
+
+# IDEs and OS artifacts
+.vscode/
+.idea/
+.DS_Store
