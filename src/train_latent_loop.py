@@ -14,7 +14,7 @@ try:
 except ImportError:
     pass
 
-from .model_architecture import Mamba2LatentLoop4B
+from .model_architecture import Mamba2LatentLoop4B, MambaJEPAEngine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -47,34 +47,6 @@ def get_dataloader(data_dir="F:\\JEPA_Model\\distilled_data", batch_size=4, num_
     dataset = JEPADataset(data_dir)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
 
-class LatentProjectionHead(nn.Module):
-    def __init__(self, d_model=4096, d_latent=1024):
-        super().__init__()
-        self.proj = nn.Linear(d_model, d_latent)
-
-    def forward(self, x):
-        # x: [Batch, Seq_Len, 4096]
-        # Mean pool across sequence dimension
-        pooled = x.mean(dim=1) # [Batch, 4096]
-        return self.proj(pooled) # [Batch, 1024]
-
-class MambaJEPAEngine(nn.Module):
-    def __init__(self, vocab_size=151643, d_model=4096, num_blocks=24, max_budget=64, d_latent=1024):
-        super().__init__()
-        self.mamba_loop = Mamba2LatentLoop4B(d_model=d_model, num_blocks=num_blocks, max_budget=max_budget)
-        self.projection_head = LatentProjectionHead(d_model=d_model, d_latent=d_latent)
-
-    def forward(self, input_tokens):
-        # input_tokens: [Batch, Seq_Len]
-        # input_tokens are passed to mamba_loop directly as placeholder handling is within it
-        hidden_state, global_steps = self.mamba_loop(input_tokens)
-
-        # mamba_loop returns (hidden_state, global_steps)
-
-        # Project to target concept space
-        student_concept = self.projection_head(hidden_state)
-
-        return student_concept, global_steps
 
 def train_loop(
     epochs=10,
