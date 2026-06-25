@@ -47,7 +47,7 @@ class JEPADataset(Dataset):
 
 def get_dataloader(data_dir="F:\\JEPA_Model\\distilled_data", batch_size=4, num_workers=0, curriculum_phase="logic"):
     dataset = JEPADataset(data_dir, curriculum_phase=curriculum_phase)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True)
 
 
 def train_loop(
@@ -107,6 +107,8 @@ def train_loop(
 
     optimizer.zero_grad()
 
+    mamba_state = None
+
     for epoch in range(starting_epoch, epochs):
         # If resuming in the middle of an epoch, skip the first `starting_batch` batches
         if epoch == starting_epoch and starting_batch > 0:
@@ -119,7 +121,7 @@ def train_loop(
             actual_batch_idx = actual_batch_idx + (starting_batch if epoch == starting_epoch else 0)
 
             # Forward pass
-            student_concept, global_steps = model(input_tokens)
+            student_concept, global_steps, mamba_state = model(input_tokens, mamba_state=mamba_state)
 
             # Latent Alignment Loss: MSE(H_final, Y_target) + (1.0 - CosineSimilarity(H_final, Y_target))
             mse_loss = mse_criterion(student_concept, target_concept)
@@ -137,6 +139,9 @@ def train_loop(
 
             # Backward pass
             accelerator.backward(loss_scaled)
+
+            if mamba_state is not None:
+                mamba_state = [s.detach() if s is not None else None for s in mamba_state]
 
             # Gradient Accumulation
             if (actual_batch_idx + 1) % accumulation_steps == 0:

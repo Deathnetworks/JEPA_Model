@@ -14,6 +14,22 @@ from src.model_architecture import MambaJEPAEngine, DualStageLatentDecoder
 # Reduce logging spam for the interactive CLI
 logging.basicConfig(level=logging.WARNING, format='%(message)s')
 
+def chunked_latent_ingestion(engine, input_ids, mamba_state, chunk_size=8192):
+    seq_len = input_ids.shape[1]
+    final_concept = None
+    final_global_steps = None
+
+    for start_idx in range(0, seq_len, chunk_size):
+        end_idx = min(start_idx + chunk_size, seq_len)
+        chunk_ids = input_ids[:, start_idx:end_idx]
+
+        final_concept, final_global_steps, mamba_state = engine(chunk_ids, mamba_state=mamba_state)
+
+        if hasattr(torch.xpu, 'empty_cache'):
+            torch.xpu.empty_cache()
+
+    return final_concept, final_global_steps, mamba_state
+
 def print_header():
     print("="*60)
     print(" 🧠 Mamba2-Latent-Loop-8B Interactive Harness ".center(60))
@@ -45,7 +61,7 @@ def run_interactive_cli():
     dummy_input = tokenizer("Warmup sequence.", return_tensors="pt").to(device)["input_ids"]
     with torch.no_grad():
         for _ in range(2):
-            _concept, _ = engine(dummy_input)
+            _concept, _, _ = engine(dummy_input)
             _logits = decoder(_concept)
     if hasattr(torch.xpu, 'synchronize'):
         torch.xpu.synchronize()
@@ -53,6 +69,7 @@ def run_interactive_cli():
     print_header()
 
     # 4. Interactive Loop
+    mamba_state = None
     while True:
         try:
             prompt = input("\n[User] >>> ")
@@ -67,20 +84,20 @@ def run_interactive_cli():
 
             # Measured Execution Block
             start_time = time.perf_counter()
-            
+
             with torch.no_grad():
                 # Phase A: Latent Reasoning (ALGR)
                 reasoning_start = time.perf_counter()
-                student_concept, global_steps = engine(input_tokens)
+                student_concept, global_steps, mamba_state = chunked_latent_ingestion(engine, input_tokens, mamba_state)
                 if hasattr(torch.xpu, 'synchronize'): torch.xpu.synchronize()
                 reasoning_time = time.perf_counter() - reasoning_start
-                
+
                 # Phase B: Syntax Decoding
                 decoding_start = time.perf_counter()
                 logits = decoder(student_concept)
                 if hasattr(torch.xpu, 'synchronize'): torch.xpu.synchronize()
                 decoding_time = time.perf_counter() - decoding_start
-                
+
                 # Token Extraction
                 token_ids = torch.argmax(logits, dim=-1)
                 output_text = tokenizer.batch_decode(token_ids, skip_special_tokens=True)[0]
