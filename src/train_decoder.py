@@ -123,5 +123,9 @@ def train_decoder_loop(
                         loss.item()
                     ])
 
+    # Save model checkpoint
+    torch.save(model.state_dict(), "latent_decoder.pth")
+    logging.info("Model saved to latent_decoder.pth")
+
 if __name__ == "__main__":
     train_decoder_loop()

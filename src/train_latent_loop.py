@@ -139,5 +139,9 @@ def train_loop(
                         avg_routing_steps.item()
                     ])
 
+    # Save model checkpoint
+    torch.save(model.state_dict(), "jepa_engine.pth")
+    logging.info("Model saved to jepa_engine.pth")
+
 if __name__ == "__main__":
     train_loop()
