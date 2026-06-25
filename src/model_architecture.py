@@ -44,7 +44,7 @@ class Mamba2SSDBlock(nn.Module):
         self.conv1d = nn.Conv1d(in_channels=self.d_inner, out_channels=self.d_inner, kernel_size=4, padding=3-1)
         self.out_proj = nn.Linear(self.d_inner, d_model)
 
-    def forward(self, x):
+    def forward(self, x, mamba_state=None):
         # x: [Batch, Seq_Len, 4096]
         batch, seq_len, _ = x.shape
         fused_states = self.in_proj(x)
@@ -56,7 +56,13 @@ class Mamba2SSDBlock(nn.Module):
         conv_out = self.conv1d(x_split.transpose(1, 2)).transpose(1, 2)[:, :seq_len, :]
         activated = F.silu(conv_out)
 
-        return self.out_proj(activated)
+        # State update for Chunked State-Passing
+        if mamba_state is None:
+            mamba_state = torch.zeros(batch, self.d_state, self.d_inner, device=x.device)
+        # Dummy simulated update
+        mamba_state = mamba_state + 1e-5
+
+        return self.out_proj(activated), mamba_state
 
 class Mamba2LatentLoop8B(nn.Module):
     def __init__(self, d_model=6144, num_blocks=32, max_budget=64):
@@ -73,7 +79,7 @@ class Mamba2LatentLoop8B(nn.Module):
         self.blocks = nn.ModuleList([Mamba2SSDBlock(d_model=d_model) for _ in range(num_blocks)])
         self.routers = nn.ModuleList([MambaGraphRouter(d_model=d_model, num_blocks=num_blocks) for _ in range(num_blocks)])
 
-    def forward(self, tokens, hidden_state=None):
+    def forward(self, tokens, hidden_state=None, mamba_state=None):
         # Initial state handling if not explicitly passed from upstream JEPA
         if hidden_state is None:
             # Placeholder tracking assuming token embeddings are handled upstream
@@ -81,6 +87,9 @@ class Mamba2LatentLoop8B(nn.Module):
 
         batch, seq_len, _ = hidden_state.shape
         global_steps = torch.zeros(batch, seq_len, 1, device=hidden_state.device)
+
+        if mamba_state is None:
+            mamba_state = [None] * self.num_blocks
 
         # Active token mapping trace across execution steps
         current_block_idx = 0
@@ -94,7 +103,8 @@ class Mamba2LatentLoop8B(nn.Module):
             hidden_state = hidden_state + step_env + block_env
 
             # Compute Layer Transformation
-            hidden_state = self.blocks[current_block_idx](hidden_state) + hidden_state
+            block_out, mamba_state[current_block_idx] = self.blocks[current_block_idx](hidden_state, mamba_state[current_block_idx])
+            hidden_state = block_out + hidden_state
 
             # Evaluate Routing Vectors
             route_probs = self.routers[current_block_idx](hidden_state, global_steps, self.max_budget)
@@ -103,7 +113,7 @@ class Mamba2LatentLoop8B(nn.Module):
             global_steps += 1
             current_block_idx += 1
 
-        return hidden_state, global_steps
+        return hidden_state, global_steps, mamba_state
 class LatentProjectionHead(nn.Module):
     def __init__(self, d_model=6144, d_latent=1024):
         super().__init__()
@@ -122,17 +132,17 @@ class MambaJEPAEngine(nn.Module):
         self.mamba_loop = Mamba2LatentLoop8B(d_model=d_model, num_blocks=num_blocks, max_budget=max_budget)
         self.projection_head = LatentProjectionHead(d_model=d_model, d_latent=d_latent)
 
-    def forward(self, input_tokens):
+    def forward(self, input_tokens, mamba_state=None):
         # input_tokens: [Batch, Seq_Len]
         hidden_state = self.embedding(input_tokens)
-        hidden_state, global_steps = self.mamba_loop(hidden_state)
+        hidden_state, global_steps, mamba_state = self.mamba_loop(hidden_state, mamba_state=mamba_state)
 
-        # mamba_loop returns (hidden_state, global_steps)
+        # mamba_loop returns (hidden_state, global_steps, mamba_state)
 
         # Project to target concept space
         student_concept = self.projection_head(hidden_state)
 
-        return student_concept, global_steps
+        return student_concept, global_steps, mamba_state
 
 class DualStageLatentDecoder(nn.Module):
     def __init__(self, d_latent=1024, max_seq_len=256, d_model=6144, vocab_size=151643):
