@@ -1,8 +1,14 @@
-# Mamba2-Latent-Loop-4B Engine
+# Mamba2-Latent-Loop-8B Engine
 
-This repository contains the implementation codebase for a non-autoregressive, latent-predictive reasoning engine. It utilizes **Mamba-2 State Space Duality (SSD)** blocks for linear-time context scaling and **Arbitrary Layer Graph Routing (ALGR)** to dynamically recycle computational layers. 
+This repository contains an 8 Billion parameter, non-autoregressive, latent-predictive reasoning engine utilizing **Mamba-2 State Space Duality (SSD)** and **Arbitrary Layer Graph Routing (ALGR)**. 
 
-The engine is trained via mathematical knowledge distillation from `Qwen/Qwen3.6-27B` and operates natively on Intel hardware acceleration (specifically optimized for the Intel Arc Pro B70 GPU).
+Optimized for Intel Arc Pro B70 (XPU) via CPU offloading, this engine uses a multi-stage curriculum learning pipeline to perfectly distill complex coding and agentic reasoning from massive teacher models.
+
+## 🚀 Features
+* **8B Mamba-2 Core:** Capable of massive context ingestion with linear $O(N)$ scaling.
+* **Curriculum Distillation:** Separates logic tracking from syntax generation to prevent polyglot mode collapse.
+* **Auto-Resumption:** Built-in fault tolerance. Training can be interrupted and resumed exactly where it left off, recovering all optimizer states from CPU RAM/Disk.
+* **Autonomous Compiler Feedback:** The inference harness compiles its own Rust/C++ outputs and routes errors mathematically back into the latent engine for self-correction.
 
 ---
 
@@ -10,7 +16,7 @@ The engine is trained via mathematical knowledge distillation from `Qwen/Qwen3.6
 
 Standard LLMs suffer from Autoregressive (AR) generation bottlenecks. This engine solves that by thinking entirely in abstract mathematical concepts before translating the final thought into text.
 
-* **Parameter Count:** ~4 Billion (Simulated 4-bit precision base)
+* **Parameter Count:** ~8 Billion (Simulated 4-bit precision base)
 * **Core Engine:** 24 Mamba-2 SSD Blocks. Eliminates the $O(N^2)$ attention matrix explosion, allowing massive codebases to be ingested within a fixed memory footprint.
 * **The Graph Router:** Every block contains a micro-router. Instead of passing through layers sequentially, the model mathematically evaluates its state and dynamically loops back, repeats, or skips layers until it finds the optimal latent concept.
 * **Dual-Stage Latent Speculative Decoder:** 1. *NAR Draft Canvas:* Projects the 1024-dimensional latent concept simultaneously across a 256-token canvas.
@@ -68,7 +74,7 @@ Execute the pipeline natively:
 * **Stage 0 (Pre-flight Downloader):** Connects to Hugging Face to cache `Qwen/Qwen3.6-27B`, `BAAI/bge-large-en-v1.5`, and the agentic SFT datasets to local disk to prevent network timeouts.
 * **Stage 1 (Dataset Preparation):** Parses the JSONL datasets, handles continuous sequence padding, and chunks the tokens into `[Batch, 2048]` memory-mapped `.pt` files.
 * **Stage 2 (Teacher Distillation):** Loads Qwen in 4-bit precision alongside the BGE Concept Encoder. Extracts Qwen's text and encodes it into 1024-dimensional Target Concept Vectors.
-* **Stage 3 (JEPA Loop Training):** Trains the 4B Mamba-2 Engine using Quantization Aware Training (QAT). Optimizes for Latent Alignment (MSE + Cosine Similarity) while penalizing excessive routing loops.
+* **Stage 3 (JEPA Loop Training):** Trains the 8B Mamba-2 Engine using Quantization Aware Training (QAT). Optimizes for Latent Alignment (MSE + Cosine Similarity) while penalizing excessive routing loops.
 * **Stage 4 (Decoder Training):** Freezes the Mamba engine and symbiotically trains the Dual-Stage Decoder to translate the mathematical concept vectors back into strict text syntax.
 * **Stage 5 (Autonomous Inference):** Launches the agent.
 

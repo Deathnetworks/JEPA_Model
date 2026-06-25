@@ -1,41 +1,31 @@
-# PART 1: Architectural Specification (The Mamba2-Latent-Loop-4B Engine)
+# PART 1: Architectural Specification (The Mamba2-Latent-Loop-8B Engine)
 
 ## I. System Overview & Hyperparameters
+The **Mamba2-Latent-Loop-8B Engine** utilizes **Mamba-2 State Space Duality (SSD)** blocks for linear-time context scaling and **Arbitrary Layer Graph Routing (ALGR)**. To handle the 8B size on local hardware, training relies on DeepSpeed/ZeRO-3 CPU offloading via `accelerate`.
 
-The **Mamba2-Latent-Loop-4B Engine** is a non-autoregressive, latent-predictive model utilizing **Mamba-2 State Space Duality (SSD)** blocks to maintain linear time and memory scaling ($O(N)$). It employs **Arbitrary Layer Graph Routing (ALGR)** to dynamically route tokens across its physical blocks based on computational complexity.
-
-* **Total Parameter Count:** ~3.64 Billion
-* **Vocabulary Size ($V$):** 151,643 (Directly matches the `Qwen/Qwen3.6-27B` tokenizer footprint)
-* **Hidden Dimension ($d_{model}$):** 4096
+* **Total Parameter Count:** ~8.2 Billion
+* **Vocabulary Size ($V$):** 151,643
+* **Hidden Dimension ($d_{model}$):** 6144
 * **Mamba Expansion Factor ($E$):** 2
-* **Inner Dimension ($d_{inner}$):** $d_{model} \times E = 8192$
+* **Inner Dimension ($d_{inner}$):** $d_{model} \times E = 12288$
 * **SSM State Dimension ($d_{state}$):** 128
-* **SSM Head Dimension ($d_{head}$):** 128
-* **Number of SSM Heads ($nheads$):** $d_{inner} / d_{head} = 64$
+* **Number of SSM Heads ($nheads$):** $d_{inner} / 128 = 96$
 * **1D Convolution Width:** 4
-* **Physical Blocks ($L_{physical}$):** 24 identical, re-routable Mamba-2 layers
-* **Max Computational Budget ($T_{max}$):** 64 total block iterations per sequence
+* **Physical Blocks ($L_{physical}$):** 32 identical, re-routable Mamba-2 layers
+* **Max Computational Budget ($T_{max}$):** 64 total block iterations
 * **Latent/Concept Dimension ($d_{latent}$):** 1024
 
----
-
 ## II. Exact Tensor Shape Directory
-
-To avoid runtime shape mismatches, Jules must enforce these precise dimensions across all operations:
-
 * **Input Tokens:** `[Batch, Seq_Len]`
-* **Initial Hidden State ($H_0$):** `[Batch, Seq_Len, 4096]`
-* **Dynamic State Vector ($H_t$):** `[Batch, Seq_Len, 4096]`
-* **Mamba-2 Combined Projection:** `[Batch, Seq_Len, 16512]` *(Calculated as $2 \times d_{inner} + 2 \times d_{state} + nheads \rightarrow 16384 + 256 + 64 = 16640$)*
-* **SSM Recurrent State ($h_t$):** `[Batch, 64, 128, 128]`
+* **Initial Hidden State ($H_0$):** `[Batch, Seq_Len, 6144]`
+* **Mamba-2 Combined Projection:** `[Batch, Seq_Len, 24928]` *(Calculated as $2 \times d_{inner} + 2 \times d_{state} + nheads$)*
+* **SSM Recurrent State ($h_t$):** `[Batch, 96, 128, 128]`
 * **Routing Tracker Matrix:** `[Batch, Seq_Len, 1]`
-* **Router Probability Output:** `[Batch, Seq_Len, 25]` *(24 physical blocks + 1 exit state)*
+* **Router Probability Output:** `[Batch, Seq_Len, 33]` *(32 blocks + 1 exit)*
 * **Target Latent Vector ($Y_{latent}$):** `[Batch, 1024]`
 * **Decoder Output Tokens:** `[Batch, Max_Output_Tokens, 151643]`
 
----
-
-## III. Core Component Blueprint
+## III. Core Components Blueprint
 
 ### 1. The Multi-Hop Graph Router
 
@@ -63,7 +53,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MambaGraphRouter(nn.Module):
-    def __init__(self, d_model=4096, num_blocks=24):
+    def __init__(self, d_model=6144, num_blocks=32):
         super().__init__()
         self.routing_head = nn.Linear(d_model, num_blocks + 1)
         
@@ -85,8 +75,8 @@ class MambaGraphRouter(nn.Module):
 
 To prevent vector saturation when recycling blocks, Jules must implement continuous learned embedding matrices to update the state before entering any block:
 
-* `Embedding_global`: Maps integers $1 \dots 64 \rightarrow 4096$
-* `Embedding_block`: Maps block indices $1 \dots 24 \rightarrow 4096$
+* `Embedding_global`: Maps integers $1 \dots 64 \rightarrow \mathbf{6144}$
+* `Embedding_block`: Maps block indices $1 \dots \mathbf{32} \rightarrow \mathbf{6144}$
 
 $$H_{augmented} = H_{current} + \text{Embedding}_{global}(\text{steps}) + \text{Embedding}_{block}(\text{target\_idx})$$
 
@@ -95,4 +85,12 @@ $$H_{augmented} = H_{current} + \text{Embedding}_{global}(\text{steps}) + \text{
 * **Stage 1 (Non-Autoregressive Draft Canvas):** A projection network that maps the final 1024-dimensional latent vector across a complete text canvas (`Max_Output_Tokens = 256`) simultaneously.
 * **Stage 2 (Causal Speculative Sweep):** A 2-layer causal autoregressive transformer block that processes the Stage 1 output canvas in parallel, correcting syntax and code logic bugs (e.g., mismatched brackets or variables) without re-invoking the Mamba-2 reasoning blocks.
 
+## IV. Curriculum Learning Strategy
+Distillation occurs in isolated phases to prevent mode collapse:
+1. **Phase A (Logic Mapping):** Trains the JEPA engine to map object-oriented logic to system logic.
+2. **Phase B (Agentic Tool Use):** Trains the JEPA engine to trigger tool commands based on state context.
+3. **Phase C (Polyglot Decoder):** Trains the Decoder exclusively to map perfect concepts to multi-language syntax arrays.
+
+## V. Checkpointing & Resumption
+The architecture enforces continuous state saving. The training loop intercepts keyboard interrupts or crash signals, writing the optimizer states and global step count to a `checkpoint_latest/` directory to allow for instant resumption.
 ---
