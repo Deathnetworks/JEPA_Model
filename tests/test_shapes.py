@@ -5,7 +5,7 @@ import torch
 # Ensure the root src folder path is exposed to the local test runner runtime
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.model_architecture import Mamba2LatentLoop4B
+from src.model_architecture import Mamba2LatentLoop8B
 
 def test_engine_tensor_shapes():
     """
@@ -18,7 +18,7 @@ def test_engine_tensor_shapes():
     print(f"[TEST RUNNER] Targets execution pipeline on compute engine: {device}")
 
     # Initialize engine architecture configurations
-    model = Mamba2LatentLoop4B(d_model=128, num_blocks=4, max_budget=4).to(device)
+    model = Mamba2LatentLoop8B(d_model=128, num_blocks=4, max_budget=4).to(device)
     model.eval()
 
     # Generate mock data: Batch size = 2, Sequence Length = 512 tokens

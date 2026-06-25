@@ -7,7 +7,7 @@ class MambaGraphRouter(nn.Module):
     Arbitrary Layer Graph Routing (ALGR) Head.
     Evaluates hidden states and routes tokens dynamically.
     """
-    def __init__(self, d_model=4096, num_blocks=24):
+    def __init__(self, d_model=6144, num_blocks=32):
         super().__init__()
         self.num_blocks = num_blocks
         self.routing_head = nn.Linear(d_model, num_blocks + 1)
@@ -30,7 +30,7 @@ class Mamba2SSDBlock(nn.Module):
     Simulated State Space Duality (SSD) Layer.
     Optimized to map down to Intel XMX hardware matrix lanes.
     """
-    def __init__(self, d_model=4096, d_state=128, nheads=64):
+    def __init__(self, d_model=6144, d_state=128, nheads=96):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
@@ -40,7 +40,7 @@ class Mamba2SSDBlock(nn.Module):
 
         # Single fused projection layout to eliminate kernel dispatch bottlenecks
         # Fuses X, Y, A, B, C matrix tracks
-        self.in_proj = nn.Linear(d_model, 2 * self.d_inner + 2 * d_state + nheads)
+        self.in_proj = nn.Linear(d_model, 24928) # 2 * self.d_inner + 2 * d_state + nheads (24928)
         self.conv1d = nn.Conv1d(in_channels=self.d_inner, out_channels=self.d_inner, kernel_size=4, padding=3-1)
         self.out_proj = nn.Linear(self.d_inner, d_model)
 
@@ -58,8 +58,8 @@ class Mamba2SSDBlock(nn.Module):
 
         return self.out_proj(activated)
 
-class Mamba2LatentLoop4B(nn.Module):
-    def __init__(self, d_model=4096, num_blocks=24, max_budget=64):
+class Mamba2LatentLoop8B(nn.Module):
+    def __init__(self, d_model=6144, num_blocks=32, max_budget=64):
         super().__init__()
         self.d_model = d_model
         self.num_blocks = num_blocks
@@ -105,7 +105,7 @@ class Mamba2LatentLoop4B(nn.Module):
 
         return hidden_state, global_steps
 class LatentProjectionHead(nn.Module):
-    def __init__(self, d_model=4096, d_latent=1024):
+    def __init__(self, d_model=6144, d_latent=1024):
         super().__init__()
         self.proj = nn.Linear(d_model, d_latent)
 
@@ -116,10 +116,10 @@ class LatentProjectionHead(nn.Module):
         return self.proj(pooled) # [Batch, 1024]
 
 class MambaJEPAEngine(nn.Module):
-    def __init__(self, vocab_size=151643, d_model=4096, num_blocks=24, max_budget=64, d_latent=1024):
+    def __init__(self, vocab_size=151643, d_model=6144, num_blocks=32, max_budget=64, d_latent=1024):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.mamba_loop = Mamba2LatentLoop4B(d_model=d_model, num_blocks=num_blocks, max_budget=max_budget)
+        self.mamba_loop = Mamba2LatentLoop8B(d_model=d_model, num_blocks=num_blocks, max_budget=max_budget)
         self.projection_head = LatentProjectionHead(d_model=d_model, d_latent=d_latent)
 
     def forward(self, input_tokens):
@@ -135,7 +135,7 @@ class MambaJEPAEngine(nn.Module):
         return student_concept, global_steps
 
 class DualStageLatentDecoder(nn.Module):
-    def __init__(self, d_latent=1024, max_seq_len=256, d_model=4096, vocab_size=151643):
+    def __init__(self, d_latent=1024, max_seq_len=256, d_model=6144, vocab_size=151643):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.d_model = d_model
