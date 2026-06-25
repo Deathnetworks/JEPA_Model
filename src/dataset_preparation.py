@@ -61,10 +61,16 @@ def process_and_save_datasets(
     chunk_size=5000,
     max_samples_per_dataset=20000
 ):
-    device = setup_device()
-
     # Path configuration
     save_path = Path(save_dir)
+
+    marker_file = save_path / ".prep_completed"
+    if marker_file.exists():
+        logging.info("Found .prep_completed marker. Datasets are already cached. Skipping preparation.")
+        return
+
+    device = setup_device()
+
     save_path.mkdir(parents=True, exist_ok=True)
 
     logging.info(f"Loading tokenizer for {model_name}...")
@@ -167,6 +173,10 @@ def process_and_save_datasets(
             out_file = save_path / f"{prefix}set_{file_index}.pt"
             torch.save(tensor_chunk, out_file)
             logging.info(f"Saved final {out_file} with shape {tensor_chunk.shape}")
+
+    # Mark as completed
+    marker_file.touch()
+
 
 if __name__ == "__main__":
     process_and_save_datasets()
