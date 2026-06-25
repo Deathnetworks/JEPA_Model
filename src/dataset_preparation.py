@@ -57,7 +57,7 @@ def prepare_text_from_item(item, dataset_name):
 def process_and_save_datasets(
     model_name="Qwen/Qwen3.6-27B",
     save_dir=r"F:\JEPA_Model\data",
-    seq_len=2048,
+    seq_len=4096,
     chunk_size=5000,
     max_samples_per_dataset=20000
 ):
