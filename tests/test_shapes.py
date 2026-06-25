@@ -25,7 +25,7 @@ def test_engine_tensor_shapes():
     mock_tokens = torch.randint(0, 1000, (2, 32)).to(device)
 
     with torch.no_grad():
-        output_state = model(mock_tokens)
+        output_state, global_steps = model(mock_tokens)
 
     print(f"[TEST SUCCESS] Returned hidden output matrix dimensionality: {list(output_state.shape)}")
 

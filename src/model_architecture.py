@@ -103,4 +103,4 @@ class Mamba2LatentLoop4B(nn.Module):
             global_steps += 1
             current_block_idx += 1
 
-        return hidden_state
+        return hidden_state, global_steps
