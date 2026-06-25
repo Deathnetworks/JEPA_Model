@@ -18,7 +18,9 @@ MODELS_TO_DOWNLOAD = [
 
 DATASETS_TO_DOWNLOAD = [
     "AlicanKiraz0/Agentic-Chain-of-Thought-Coding-SFT-Dataset",
-    "TheAgenticAI/Agentic-Reasoning"
+    "TheAgenticAI/Agentic-Reasoning",
+    "ise-uiuc/Magicoder-OSS-Instruct-75K",
+    "teknium/OpenHermes-2.5"
 ]
 
 def preflight_download():
