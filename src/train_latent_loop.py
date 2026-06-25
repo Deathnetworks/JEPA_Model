@@ -107,9 +107,9 @@ def train_loop(
 
     optimizer.zero_grad()
 
-    mamba_state = None
-
     for epoch in range(starting_epoch, epochs):
+        mamba_state = None
+    
         # If resuming in the middle of an epoch, skip the first `starting_batch` batches
         if epoch == starting_epoch and starting_batch > 0:
             active_dataloader = accelerator.skip_first_batches(dataloader, starting_batch)
