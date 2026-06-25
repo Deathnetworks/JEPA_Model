@@ -37,7 +37,7 @@ def setup_device():
     return device
 
 class InferencePipeline:
-    def __init__(self, engine_path="jepa_engine.pth", decoder_path="latent_decoder.pth", tokenizer_name="Qwen/Qwen3.6-27B"):
+    def __init__(self, engine_path="jepa_engine.pth", decoder_path="latent_decoder.pth", tokenizer_name="Jackrong/Qwopus3.6-27B-v2"):
         self.device = setup_device()
 
         logging.info(f"Loading tokenizer {tokenizer_name}...")
