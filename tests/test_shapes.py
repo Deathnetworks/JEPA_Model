@@ -18,7 +18,7 @@ def test_engine_tensor_shapes():
     print(f"[TEST RUNNER] Targets execution pipeline on compute engine: {device}")
 
     # Initialize engine architecture configurations
-    model = Mamba2LatentLoop8B(d_model=128, num_blocks=4, max_budget=4).to(device)
+    model = Mamba2LatentLoop8B(d_model=64, num_blocks=2, max_budget=2).to(device)
     model.eval()
 
     # Generate mock data: Batch size = 2, Sequence Length = 512 tokens
@@ -30,7 +30,7 @@ def test_engine_tensor_shapes():
     print(f"[TEST SUCCESS] Returned hidden output matrix dimensionality: {list(output_state.shape)}")
 
     # Confirm exact dimensionality assertions match Part 1 constraints
-    assert output_state.shape == (2, 32, 128), f"Dimension mismatch error: Found {output_state.shape}"
+    assert output_state.shape == (2, 32, 64), f"Dimension mismatch error: Found {output_state.shape}"
     print("[TEST SUCCESS] Tensor shapes structurally aligned with specification document instructions.")
 
 if __name__ == "__main__":

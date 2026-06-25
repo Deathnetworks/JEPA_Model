@@ -55,7 +55,7 @@ def prepare_text_from_item(item, dataset_name):
     return text.strip()
 
 def process_and_save_datasets(
-    model_name="Qwen/Qwen3.6-27B",
+    model_name="Jackrong/Qwopus3.6-27B-v2",
     save_dir=r"F:\JEPA_Model\data",
     seq_len=4096,
     chunk_size=5000,

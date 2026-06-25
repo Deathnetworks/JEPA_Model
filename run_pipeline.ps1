@@ -45,13 +45,26 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # Stage 3
-Write-Host "`nStarting Stage 3: JEPA Loop Training..." -ForegroundColor Cyan
-python src/train_latent_loop.py
+Write-Host "\nStarting Stage 3A: JEPA Loop Training (Logic)..." -ForegroundColor Cyan
+python src/train_latent_loop.py --curriculum_phase "logic"
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Stage 3 failed with exit code $LASTEXITCODE. Halting pipeline to prevent cascading errors." -ForegroundColor Red
+    Write-Host "ERROR: Stage 3A failed with exit code $LASTEXITCODE. Halting pipeline to prevent cascading errors." -ForegroundColor Red
     [System.Environment]::Exit($LASTEXITCODE)
 }
 
+Write-Host "\nStarting Stage 3B: JEPA Loop Training (Agentic)..." -ForegroundColor Cyan
+python src/train_latent_loop.py --curriculum_phase "agentic"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Stage 3B failed with exit code $LASTEXITCODE. Halting pipeline to prevent cascading errors." -ForegroundColor Red
+    [System.Environment]::Exit($LASTEXITCODE)
+}
+
+Write-Host "\nStarting Stage 3C: JEPA Loop Training (Creative)..." -ForegroundColor Cyan
+python src/train_latent_loop.py --curriculum_phase "creative"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Stage 3C failed with exit code $LASTEXITCODE. Halting pipeline to prevent cascading errors." -ForegroundColor Red
+    [System.Environment]::Exit($LASTEXITCODE)
+}
 # Stage 4
 Write-Host "`nStarting Stage 4: Decoder Training..." -ForegroundColor Cyan
 python src/train_decoder.py

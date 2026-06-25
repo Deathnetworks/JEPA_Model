@@ -50,7 +50,7 @@ def main():
     encoder_model.eval()
 
     # 2. Load Teacher Model (Qwen) in 4-bit Precision
-    teacher_name = "Qwen/Qwen3.6-27B"
+    teacher_name = "Jackrong/Qwopus3.6-27B-v2"
     logging.info(f"Loading Teacher Model: {teacher_name}")
 
     quantization_config = BitsAndBytesConfig(

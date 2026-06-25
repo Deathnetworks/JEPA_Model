@@ -12,7 +12,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 MODELS_TO_DOWNLOAD = [
-    "Qwen/Qwen3.6-27B",
+    "Jackrong/Qwopus3.6-27B-v2",
     "BAAI/bge-large-en-v1.5"
 ]
 
