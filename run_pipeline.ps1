@@ -59,7 +59,7 @@ if (Test-Path $venvPath) {
 }
 
 # Stage 0
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] `nStarting Stage 0: Pre-flight Cache..." -ForegroundColor Cyan
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] `nStarting Stage 0: Pre-flight Cache..." -ForegroundColor Cyan
 $startTime = Get-Date
 python src/download_models.py
 if ($LASTEXITCODE -ne 0) {
@@ -67,10 +67,10 @@ if ($LASTEXITCODE -ne 0) {
     [System.Environment]::Exit($LASTEXITCODE)
 }
 $duration = (Get-Date) - $startTime
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] Stage 0 Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 0 Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
 
 # Stage 1
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] `nStarting Stage 1: Dataset Extraction & Formatting..." -ForegroundColor Cyan
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] `nStarting Stage 1: Dataset Extraction & Formatting..." -ForegroundColor Cyan
 $startTime = Get-Date
 python src/extract_frontier_data.py
 if ($LASTEXITCODE -ne 0) {
@@ -78,10 +78,10 @@ if ($LASTEXITCODE -ne 0) {
     [System.Environment]::Exit($LASTEXITCODE)
 }
 $duration = (Get-Date) - $startTime
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] Stage 1 Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 1 Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
 
 # Stage 3
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] \nStarting Stage 3A: JEPA Loop Training (Frontier Traces)..." -ForegroundColor Cyan
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] \nStarting Stage 3A: JEPA Loop Training (Frontier Traces)..." -ForegroundColor Cyan
 $startTime = Get-Date
 python src/train_latent_loop.py --epochs 2 --curriculum_phase "frontier_traces"
 if ($LASTEXITCODE -ne 0) {
@@ -89,9 +89,9 @@ if ($LASTEXITCODE -ne 0) {
     [System.Environment]::Exit($LASTEXITCODE)
 }
 $duration = (Get-Date) - $startTime
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] Stage 3A Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 3A Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
 
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] \nStarting Stage 3B: JEPA Loop Training (General Knowledge)..." -ForegroundColor Cyan
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] \nStarting Stage 3B: JEPA Loop Training (General Knowledge)..." -ForegroundColor Cyan
 $startTime = Get-Date
 python src/train_latent_loop.py --epochs 2 --curriculum_phase "general_knowledge"
 if ($LASTEXITCODE -ne 0) {
@@ -99,9 +99,9 @@ if ($LASTEXITCODE -ne 0) {
     [System.Environment]::Exit($LASTEXITCODE)
 }
 $duration = (Get-Date) - $startTime
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] Stage 3B Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 3B Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
 
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] \nStarting Stage 3C: JEPA Loop Training (Code Mechanics)..." -ForegroundColor Cyan
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] \nStarting Stage 3C: JEPA Loop Training (Code Mechanics)..." -ForegroundColor Cyan
 $startTime = Get-Date
 python src/train_latent_loop.py --epochs 2 --curriculum_phase "code_mechanics"
 if ($LASTEXITCODE -ne 0) {
@@ -109,10 +109,10 @@ if ($LASTEXITCODE -ne 0) {
     [System.Environment]::Exit($LASTEXITCODE)
 }
 $duration = (Get-Date) - $startTime
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] Stage 3C Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 3C Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
 
 # # Stage 4
-# Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] `nStarting Stage 4: Decoder Training..." -ForegroundColor Cyan
+# Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] `nStarting Stage 4: Decoder Training..." -ForegroundColor Cyan
 # $startTime = Get-Date
 # python src/train_decoder.py
 # if ($LASTEXITCODE -ne 0) {
@@ -121,7 +121,7 @@ Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] Stage 3C Completed in 
 # }
 
 # Stage 5
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] `nStarting Stage 5: Inference Harness..." -ForegroundColor Cyan
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] `nStarting Stage 5: Inference Harness..." -ForegroundColor Cyan
 $startTime = Get-Date
 python src/inference_harness.py
 if ($LASTEXITCODE -ne 0) {
@@ -129,6 +129,6 @@ if ($LASTEXITCODE -ne 0) {
     [System.Environment]::Exit($LASTEXITCODE)
 }
 $duration = (Get-Date) - $startTime
-Write-Host "[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] Stage 5 Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 5 Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
 
-Write-Host "`n[$([Get-Date -Format 'yyyy-MM-dd HH:mm:ss'])] Pipeline completed successfully! All stages finished without errors." -ForegroundColor Green
+Write-Host "`n[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Pipeline completed successfully! All stages finished without errors." -ForegroundColor Green
