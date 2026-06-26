@@ -7,13 +7,16 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import bitsandbytes as bnb
 
 try:
     import intel_extension_for_pytorch as ipex
 except ImportError:
     pass
 
-from .model_architecture import DualStageLatentDecoder
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from src.model_architecture import DualStageLatentDecoder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -56,22 +59,25 @@ def train_decoder_loop(
     device = torch.device("xpu" if torch.xpu.is_available() else "cpu")
     logging.info(f"Targeting native compute via device: {device}")
 
-    # Initialize Engine
-    # Max seq len 256 might not be enough for full traces, but let's stick to the architecture default unless we modify model_architecture.py
-    # We will dynamically pad up to 256 or slice
-    model = DualStageLatentDecoder().to(device)
+    if device.type == 'cpu':
+        logging.warning("Running on CPU, using heavily downgraded hyperparameters to avoid OOM.")
+        model = DualStageLatentDecoder(d_model=64, d_latent=1024).to(device)
+    else:
+        model = DualStageLatentDecoder().to(device)
+
     model.train()
 
-    # Optimized optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    optimizer = bnb.optim.AdamW8bit(
+        model.parameters(),
+        lr=learning_rate,
+        betas=(0.9, 0.95),
+        weight_decay=0.1
+    )
 
-    # Loss functions
-    criterion = nn.CrossEntropyLoss(ignore_index=0) # 0 is assumed to be padding
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
 
-    # DataLoader
     dataloader = get_decoder_dataloader(data_dir=data_dir, batch_size=1)
 
-    # Setup logging CSV
     csv_filename = "decoder_training_trace.csv"
     file_exists = os.path.isfile(csv_filename)
     with open(csv_filename, mode='a', newline='') as f:
@@ -94,16 +100,11 @@ def train_decoder_loop(
 
                 target_concept = torch.stack(target_concepts_list).to(device)
 
-                # Pad sequences, but also slice to max_seq_len supported by decoder (e.g. 256 from model_architecture)
                 max_len = model.max_seq_len
                 qwen_tokens_list_sliced = [tokens[:max_len] for tokens in qwen_tokens_list]
 
-                # Pad to uniform shape
                 qwen_tokens = torch.nn.utils.rnn.pad_sequence(qwen_tokens_list_sliced, batch_first=True, padding_value=0).to(device).long()
 
-                # Further pad to exact max_len if needed by architecture (DualStageLatentDecoder expects it or handles dynamically?)
-                # Wait, DualStageLatentDecoder stage1 outputs `[Batch, max_seq_len, d_model]` unconditionally.
-                # So we must pad/slice exactly to `max_seq_len`.
                 seq_len_current = qwen_tokens.shape[1]
                 if seq_len_current < max_len:
                     padding = torch.zeros((qwen_tokens.shape[0], max_len - seq_len_current), dtype=qwen_tokens.dtype, device=device)
@@ -111,25 +112,21 @@ def train_decoder_loop(
 
                 optimizer.zero_grad()
 
-                # Forward pass
-                # logits: [Batch, 256, 151643]
-                logits = model(target_concept)
+                with torch.autocast(device_type="xpu" if device.type == "xpu" else "cpu", dtype=torch.bfloat16 if device.type == "xpu" else torch.float32):
+                    logits = model(target_concept)
 
-                batch_size, seq_len, vocab_size = logits.shape
-                logits_flat = logits.view(batch_size * seq_len, vocab_size)
-                qwen_tokens_flat = qwen_tokens.view(-1)
+                    batch_size, seq_len, vocab_size = logits.shape
+                    logits_flat = logits.view(batch_size * seq_len, vocab_size)
+                    qwen_tokens_flat = qwen_tokens.view(-1)
 
-                loss = criterion(logits_flat, qwen_tokens_flat)
+                    loss = criterion(logits_flat, qwen_tokens_flat)
 
-                # Backward pass
                 loss.backward()
                 optimizer.step()
 
-                # Clear VRAM cache hook
-                if hasattr(torch.xpu, 'empty_cache'):
+                if hasattr(torch, 'xpu') and hasattr(torch.xpu, 'empty_cache'):
                     torch.xpu.empty_cache()
 
-                # Print real-time metrics
                 if (i // mini_batch_size) % 10 == 0:
                     print(
                         f"Epoch: {epoch+1}/{epochs} | "
@@ -137,7 +134,6 @@ def train_decoder_loop(
                         f"CrossEntropyLoss: {loss.item():.4f}"
                     )
 
-                    # Log to CSV
                     with open(csv_filename, mode='a', newline='') as f:
                         writer = csv.writer(f)
                         writer.writerow([
@@ -147,7 +143,6 @@ def train_decoder_loop(
                             loss.item()
                         ])
 
-    # Save model checkpoint
     torch.save(model.state_dict(), "latent_decoder.pth")
     logging.info("Model saved to latent_decoder.pth")
 

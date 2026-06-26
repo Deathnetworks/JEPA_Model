@@ -10,6 +10,8 @@ try:
 except ImportError:
     pass
 
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.model_architecture import MambaJEPAEngine, DualStageLatentDecoder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,20 +26,18 @@ def extract_rust_code(text: str) -> str:
 
 def setup_device():
     """
-    Ensure the target device is the Intel Arc Pro B70 GPU (xpu).
+    Ensure the target device is the Intel Arc Pro B70 GPU (xpu) if available.
     """
-    try:
-        import intel_extension_for_pytorch as ipex
-        logging.info("Successfully imported intel_extension_for_pytorch.")
-    except ImportError:
-        logging.warning("intel_extension_for_pytorch not found.")
-
-    device = torch.device("xpu")
-    logging.info(f"Targeting native Intel GPU compute via device: {device}")
+    if torch.xpu.is_available():
+        device = torch.device("xpu")
+        logging.info(f"Targeting native Intel GPU compute via device: {device}")
+    else:
+        device = torch.device("cpu")
+        logging.warning("XPU not available, falling back to CPU. Performance will be degraded.")
     return device
 
 class InferencePipeline:
-    def __init__(self, engine_path="jepa_engine.pth", decoder_path="latent_decoder.pth", tokenizer_name="Jackrong/Qwopus3.6-27B-v2"):
+    def __init__(self, engine_path="jepa_engine.pth", decoder_path="latent_decoder.pth", tokenizer_name="Qwen/Qwen2.5-7B-Instruct"):
         self.device = setup_device()
 
         logging.info(f"Loading tokenizer {tokenizer_name}...")
@@ -49,8 +49,20 @@ class InferencePipeline:
                 self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
         logging.info("Instantiating MambaJEPAEngine and DualStageLatentDecoder...")
-        self.engine = MambaJEPAEngine().to(self.device)
-        self.decoder = DualStageLatentDecoder().to(self.device)
+        if self.device.type == 'cpu':
+            logging.warning("Running on CPU, using heavily downgraded hyperparameters to avoid OOM.")
+            self.engine = MambaJEPAEngine(d_model=64, num_blocks=2, max_budget=2, d_latent=1024).to(self.device)
+            self.decoder = DualStageLatentDecoder(d_model=64, d_latent=1024).to(self.device)
+        else:
+            self.engine = MambaJEPAEngine().to(self.device)
+            self.decoder = DualStageLatentDecoder().to(self.device)
+
+        if self.device.type == "xpu":
+            torch._inductor.config.freezing = True
+            torch._inductor.config.max_autotune = True
+            torch._inductor.config.coordinate_descent_tuning = True
+            self.engine = torch.compile(self.engine, backend="inductor")
+            self.decoder = torch.compile(self.decoder, backend="inductor")
 
         logging.info(f"Loading weights from {engine_path} and {decoder_path}...")
         try:
@@ -71,27 +83,35 @@ class InferencePipeline:
     def generate_code(self, prompt: str, max_retries: int = 3):
         current_prompt = prompt
         extracted_code = ""
+        chunk_size = 4096
 
         for attempt in range(max_retries):
             logging.info(f"Attempt {attempt + 1}/{max_retries} for prompt: '{current_prompt[:50]}...'")
 
-            # Tokenize prompt
             inputs = self.tokenizer(current_prompt, return_tensors="pt").to(self.device)
             input_tokens = inputs["input_ids"]
+            seq_len = input_tokens.size(1)
+
+            mamba_state = None
+            student_concept = None
 
             with torch.no_grad():
-                # Pass through MambaJEPAEngine
-                # Returns student_concept [Batch, 1024], global_steps [Batch, Seq_Len, 1]
-                student_concept, _ = self.engine(input_tokens)
+                for t in range(0, seq_len, chunk_size):
+                    chunk_input = input_tokens[:, t:t+chunk_size]
 
-                # Pass through DualStageLatentDecoder
-                # Returns logits [Batch, 256, Vocab_Size]
-                logits = self.decoder(student_concept)
+                    with torch.autocast(device_type="xpu" if self.device.type == "xpu" else "cpu", dtype=torch.bfloat16 if self.device.type == "xpu" else torch.float32):
+                        student_concept, _, mamba_state = self.engine(chunk_input, mamba_state=mamba_state)
 
-                # Argmax to get token IDs
+                    if mamba_state is not None:
+                        mamba_state = mamba_state.detach()
+
+                    if hasattr(torch, 'xpu') and hasattr(torch.xpu, 'empty_cache'):
+                        torch.xpu.empty_cache()
+
+                with torch.autocast(device_type="xpu" if self.device.type == "xpu" else "cpu", dtype=torch.bfloat16 if self.device.type == "xpu" else torch.float32):
+                    logits = self.decoder(student_concept)
+
                 token_ids = torch.argmax(logits, dim=-1) # [Batch, 256]
-
-                # Decode tokens
                 decoded_text = self.tokenizer.batch_decode(token_ids, skip_special_tokens=True)[0]
 
             logging.info(f"\n--- Raw Generated Output (Attempt {attempt + 1}) ---")
@@ -103,7 +123,6 @@ class InferencePipeline:
             print(extracted_code)
             logging.info("------------------------\n")
 
-            # Subprocess Compilation
             temp_file = "temp_agent_output.rs"
             with open(temp_file, "w") as f:
                 f.write(extracted_code)
@@ -125,10 +144,8 @@ class InferencePipeline:
                     current_prompt = f"{prompt}\n\nThe previous attempt failed with:\n{error_msg}\nPlease fix the architectural logic."
 
             finally:
-                # Cleanup iteration logic (just in case we need it here, but we do full cleanup later)
                 pass
 
-        # Cleanup
         try:
             if os.path.exists("temp_agent_output.rs"):
                 os.remove("temp_agent_output.rs")
