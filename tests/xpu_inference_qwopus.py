@@ -15,7 +15,7 @@ torch._inductor.config.coordinate_descent_tuning = True # Enhances auto-tuning s
 # We explicitly disable CUDA graphs as we are on XPU.
 torch._inductor.config.triton.cudagraphs = False
 
-def setup_model_and_tokenizer(model_id="Qwen/Qwen3.6-27B-v2"):
+def setup_model_and_tokenizer(model_id="Jackrong/Qwopus3.6-27B-v2"):
     # Define quantization config
     # We keep 4-bit NF4 for weights. We will handle KV cache quantization natively in the model loading.
     bnb_config = BitsAndBytesConfig(
