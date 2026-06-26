@@ -21,7 +21,7 @@ from .model_architecture import Mamba2LatentLoop8B, MambaJEPAEngine
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class JEPADataset(Dataset):
-    def __init__(self, data_dir=r"F:\JEPA_Model\distilled_data", curriculum_phase="logic"):
+    def __init__(self, data_dir=r"F:\JEPA_Model\data\shards", curriculum_phase="frontier_traces"):
         super().__init__()
         self.data_dir = Path(data_dir.replace("\\\\", "/"))
         self.file_paths = [p for p in self.data_dir.glob("*.pt") if curriculum_phase in p.name]
@@ -33,31 +33,51 @@ class JEPADataset(Dataset):
 
     def __getitem__(self, idx):
         file_path = self.file_paths[idx]
-        data = torch.load(file_path, map_location="cpu", weights_only=False)
+        try:
+            # We load the chunk, which is a list of dicts.
+            # However, since this returns the whole chunk (up to 1000 items),
+            # we want the DataLoader to iterate over individual items.
+            # Standard PyTorch Dataset isn't perfectly mapped for this if we return the whole list.
+            # But we can use `collate_fn` to flatten the list of lists.
+            data_chunk = torch.load(file_path, map_location="cpu", weights_only=False)
+            return data_chunk
+        except Exception as e:
+            logging.warning(f"Failed to load chunk {file_path}: {e}")
+            return []
 
-        input_tokens = data['input_tokens']
-        target_concept = data['target_concept']
+def collate_jepa_chunk(batch):
+    # `batch` is a list of `data_chunk` lists from the Dataset.
+    # Usually batch_size=1 from DataLoader if we want to yield chunks.
+    # We will flatten the chunks and take a random subset or process sequentially.
+    # To keep memory bounded, we just return the flattened items up to a batch size,
+    # but the simplest way is to yield the flattened list and let the training loop handle batching
+    # OR create a custom IterableDataset.
 
-        if input_tokens.dim() > 1 and input_tokens.shape[0] == 1:
-            input_tokens = input_tokens.squeeze(0)
-        if target_concept.dim() > 1 and target_concept.shape[0] == 1:
-            target_concept = target_concept.squeeze(0)
+    # Let's flatten everything in the current Dataset batch
+    flattened = [item for sublist in batch for item in sublist]
+    if not flattened:
+        return None, None
 
-        return input_tokens, target_concept
+    # We will just pad the flattened list together into one giant batch,
+    # or the user specifies batch_size=1 to load 1 chunk (1000 items) and then
+    # in the train loop we process the chunk in mini-batches.
 
-def get_dataloader(data_dir="F:\\JEPA_Model\\distilled_data", batch_size=4, num_workers=0, curriculum_phase="logic"):
+    return flattened
+
+def get_dataloader(data_dir=r"F:\JEPA_Model\data\shards", batch_size=1, num_workers=0, curriculum_phase="frontier_traces"):
+    # batch_size=1 means we load 1 chunk (e.g. 1000 items) per iteration
     dataset = JEPADataset(data_dir, curriculum_phase=curriculum_phase)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_jepa_chunk)
 
 
 def train_loop(
     epochs=10,
-    batch_size=4,
+    mini_batch_size=4,
     accumulation_steps=4,
     gamma=0.001,
     learning_rate=1e-4,
-    data_dir=r"F:\JEPA_Model\distilled_data",
-    curriculum_phase="logic"
+    data_dir=r"F:\JEPA_Model\data\shards",
+    curriculum_phase="frontier_traces"
 ):
     accelerator = Accelerator()
     device = accelerator.device
@@ -73,8 +93,9 @@ def train_loop(
     # Loss functions
     mse_criterion = nn.MSELoss()
 
-    # DataLoader
-    dataloader = get_dataloader(data_dir=data_dir, batch_size=batch_size, curriculum_phase=curriculum_phase)
+    # DataLoader (loads full chunks)
+    # We use shuffle=False because we process chunk by chunk
+    dataloader = get_dataloader(data_dir=data_dir, batch_size=1, curriculum_phase=curriculum_phase)
 
     # Accelerate prepare
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
@@ -103,77 +124,96 @@ def train_loop(
     with open(csv_filename, mode='a', newline='') as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["Epoch", "Batch", "Latent_Loss", "Efficiency_Loss", "Total_Loss", "Avg_Routing_Steps"])
+            writer.writerow(["Epoch", "ChunkIdx", "MiniBatch", "Latent_Loss", "Efficiency_Loss", "Total_Loss", "Avg_Routing_Steps"])
 
     optimizer.zero_grad()
 
     for epoch in range(starting_epoch, epochs):
-        mamba_state = None
-    
+
         # If resuming in the middle of an epoch, skip the first `starting_batch` batches
         if epoch == starting_epoch and starting_batch > 0:
             active_dataloader = accelerator.skip_first_batches(dataloader, starting_batch)
         else:
             active_dataloader = dataloader
 
-        for actual_batch_idx, (input_tokens, target_concept) in enumerate(active_dataloader):
-            # Adjust batch index to be correct overall
-            actual_batch_idx = actual_batch_idx + (starting_batch if epoch == starting_epoch else 0)
+        for chunk_idx, flattened_chunk in enumerate(active_dataloader):
+            if not flattened_chunk:
+                continue
 
-            # Forward pass
-            student_concept, global_steps, mamba_state = model(input_tokens, mamba_state=mamba_state)
+            actual_chunk_idx = chunk_idx + (starting_batch if epoch == starting_epoch else 0)
 
-            # Latent Alignment Loss: MSE(H_final, Y_target) + (1.0 - CosineSimilarity(H_final, Y_target))
-            mse_loss = mse_criterion(student_concept, target_concept)
-            cos_sim = F.cosine_similarity(student_concept, target_concept, dim=-1).mean()
-            alignment_loss = mse_loss + (1.0 - cos_sim)
+            # Process the chunk in mini-batches
+            num_items = len(flattened_chunk)
 
-            # Efficiency Regularization: gamma * average routing steps
-            # global_steps shape: [Batch, Seq_Len, 1]
-            avg_routing_steps = global_steps.float().mean() if global_steps.dtype != torch.float32 else global_steps.mean()
-            efficiency_loss = gamma * avg_routing_steps
+            for i in range(0, num_items, mini_batch_size):
+                mini_batch = flattened_chunk[i:i+mini_batch_size]
 
-            # Total loss
-            loss = alignment_loss + efficiency_loss
-            loss_scaled = loss / accumulation_steps
+                # Pad input_tokens
+                input_tokens_list = [item["input_tokens"] for item in mini_batch]
+                target_concepts_list = [item["target_concept"] for item in mini_batch]
 
-            # Backward pass
-            accelerator.backward(loss_scaled)
+                # Dynamic padding using pad_sequence
+                # Pad token id was 0 or eos from qwen, let's use 0
+                padded_input_tokens = torch.nn.utils.rnn.pad_sequence(input_tokens_list, batch_first=True, padding_value=0).to(device)
+                target_concepts = torch.stack(target_concepts_list).to(device)
 
-            if mamba_state is not None:
-                mamba_state = [s.detach() if s is not None else None for s in mamba_state]
+                mamba_state = None
 
-            # Gradient Accumulation
-            if (actual_batch_idx + 1) % accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
+                # Forward pass
+                student_concept, global_steps, mamba_state = model(padded_input_tokens, mamba_state=mamba_state)
 
-                # Clear VRAM cache hook
-                if hasattr(torch.xpu, 'empty_cache'):
-                    torch.xpu.empty_cache()
+                # Latent Alignment Loss: MSE(H_final, Y_target) + (1.0 - CosineSimilarity(H_final, Y_target))
+                mse_loss = mse_criterion(student_concept, target_concepts)
+                cos_sim = F.cosine_similarity(student_concept, target_concepts, dim=-1).mean()
+                alignment_loss = mse_loss + (1.0 - cos_sim)
 
-            # Print real-time metrics
-            if actual_batch_idx % 1 == 0:
-                print(
-                    f"Epoch: {epoch+1}/{epochs} | "
-                    f"Batch: {actual_batch_idx+1} | "
-                    f"Align Loss: {alignment_loss.item():.4f} | "
-                    f"Eff Loss: {efficiency_loss.item():.4f} | "
-                    f"Total Loss: {loss.item():.4f} | "
-                    f"Routing Steps: {avg_routing_steps.item():.2f}"
-                )
+                # Efficiency Regularization: gamma * average routing steps
+                # global_steps shape: [Batch, Seq_Len, 1]
+                avg_routing_steps = global_steps.float().mean() if global_steps.dtype != torch.float32 else global_steps.mean()
+                efficiency_loss = gamma * avg_routing_steps
 
-                # Log to CSV
-                with open(csv_filename, mode='a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        epoch + 1,
-                        actual_batch_idx + 1,
-                        alignment_loss.item(),
-                        efficiency_loss.item(),
-                        loss.item(),
-                        avg_routing_steps.item()
-                    ])
+                # Total loss
+                loss = alignment_loss + efficiency_loss
+                loss_scaled = loss / accumulation_steps
+
+                # Backward pass
+                accelerator.backward(loss_scaled)
+
+                if mamba_state is not None:
+                    mamba_state = [s.detach() if s is not None else None for s in mamba_state]
+
+                # Gradient Accumulation
+                if ((i // mini_batch_size) + 1) % accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    # Clear VRAM cache hook
+                    if hasattr(torch.xpu, 'empty_cache'):
+                        torch.xpu.empty_cache()
+
+                # Print real-time metrics
+                if (i // mini_batch_size) % 10 == 0:
+                    print(
+                        f"Epoch: {epoch+1}/{epochs} | "
+                        f"Chunk: {actual_chunk_idx+1} | MB: {(i // mini_batch_size) + 1}/{(num_items // mini_batch_size) + 1} | "
+                        f"Align Loss: {alignment_loss.item():.4f} | "
+                        f"Eff Loss: {efficiency_loss.item():.4f} | "
+                        f"Total Loss: {loss.item():.4f} | "
+                        f"Routing Steps: {avg_routing_steps.item():.2f}"
+                    )
+
+                    # Log to CSV
+                    with open(csv_filename, mode='a', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            epoch + 1,
+                            actual_chunk_idx + 1,
+                            (i // mini_batch_size) + 1,
+                            alignment_loss.item(),
+                            efficiency_loss.item(),
+                            loss.item(),
+                            avg_routing_steps.item()
+                        ])
 
         # Save checkpoint at end of epoch
         accelerator.save_state(checkpoint_dir)
@@ -187,6 +227,6 @@ def train_loop(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--curriculum_phase", type=str, default="logic", help="Curriculum phase to filter dataset")
+    parser.add_argument("--curriculum_phase", type=str, default="frontier_traces", help="Curriculum phase to filter dataset")
     args = parser.parse_args()
     train_loop(curriculum_phase=args.curriculum_phase)
