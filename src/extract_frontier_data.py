@@ -234,9 +234,9 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
             # Limit total rows to avoid infinite loops on huge streaming datasets if we don't want to process everything
             # Set limits based on domain and dataset size
             if dataset_name == "HuggingFaceFW/fineweb-edu":
-                max_rows = 10_000_000
+                max_rows = 20_000_000
             elif domain == "frontier_traces":
-                max_rows = 5_000_000
+                max_rows = 500_000
             else:
                 max_rows = 1_000_000
 
