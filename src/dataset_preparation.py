@@ -58,8 +58,8 @@ def process_and_save_datasets(
     model_name="Jackrong/Qwopus3.6-27B-v2",
     save_dir=r"F:\JEPA_Model\data",
     seq_len=4096,
-    chunk_size=5000,
-    max_samples_per_dataset=20000
+    chunk_size=10,
+    max_samples_per_dataset=25000
 ):
     # Path configuration
     save_path = Path(save_dir)
@@ -75,6 +75,7 @@ def process_and_save_datasets(
 
     logging.info(f"Loading tokenizer for {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer.padding_side = "left" # <--- ADD THIS
 
     # Ensure pad token exists
     if tokenizer.pad_token_id is None:
@@ -128,7 +129,7 @@ def process_and_save_datasets(
                     # Pad to match standard seq_len for continuous tensor architecture
                     pad_len = seq_len - len(chunk)
                     pad_tensor = torch.full((pad_len,), tokenizer.pad_token_id, dtype=torch.long)
-                    chunk = torch.cat([chunk, pad_tensor])
+                    chunk = torch.cat([pad_tensor, chunk])
 
                 # Keep CPU tensors for saving to disk, move to XPU during training DataLoader
                 buffer.append(chunk)

@@ -2,6 +2,19 @@ $ErrorActionPreference = "Continue"
 
 Write-Host "Initializing Pipeline Environment..." -ForegroundColor Cyan
 
+# Point to the OneAPI setvars.bat, which automatically configures 
+# INCLUDE, LIB, and PATH for the compiler.
+$setvarsPath = "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+if (Test-Path $setvarsPath) {
+    cmd.exe /c "`"$setvarsPath`" && set" | ForEach-Object {
+        $key, $value = $_ -split '=', 2
+        if ($key -and $value) {
+            [System.Environment]::SetEnvironmentVariable($key, $value, "Process")
+        }
+    }
+    Write-Host "Intel OneAPI environment variables set." -ForegroundColor Green
+}
+
 # 1. Clean the local PATH to prevent length overflow errors
 $env:PATH = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
@@ -20,8 +33,9 @@ if (Test-Path ".env") {
 # We use icpx.exe (Intel C++) because it natively handles SYCL and Windows /LIBPATH flags
 $intelCompilerPath = "C:\Program Files (x86)\Intel\oneAPI\compiler\2025.3\bin\compiler"
 $env:PATH = "$intelCompilerPath;" + $env:PATH
-$env:CC = "$intelCompilerPath\icx.exe"
-$env:CXX = "$intelCompilerPath\icpx.exe"
+# Force Python/Triton to use the Intel SYCL Compiler
+$env:CC = "icx"
+$env:CXX = "icpx"
 
 # Optional safety net to strip aggressive Windows linker formats if they persist
 $env:LDFLAGS = " " 

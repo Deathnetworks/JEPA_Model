@@ -61,25 +61,49 @@ def main():
     )
 
     teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_name, trust_remote_code=True)
+    teacher_tokenizer.padding_side = 'left'
+    
+    # --- ADD THIS PRINT CHECK ---
+    print(f"DEBUG: Tokenizer padding side is: {teacher_tokenizer.padding_side}")    
+    # ----------------------------
+    
     if teacher_tokenizer.pad_token_id is None:
         if teacher_tokenizer.eos_token_id is not None:
             teacher_tokenizer.pad_token_id = teacher_tokenizer.eos_token_id
         else:
             teacher_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-
+        
+    # 1. Define memory constraints (Set to ~20GB to stay safe)
+    # 0 represents your XPU/GPU, "cpu" represents system RAM
+    max_memory_mapping = {0: "30GiB", "cpu": "15GiB"}
+    offload_dir = r"F:\JEPA_Model\offload_cache"
+    os.makedirs(offload_dir, exist_ok=True)
+    
     # Ensure the SSD offload directory exists
     offload_dir = r"F:\JEPA_Model\offload_cache"
     os.makedirs(offload_dir, exist_ok=True)
+    print(f"DEBUG: Max memory settings: {max_memory_mapping}")
 
+    # 2. Updated Teacher Model Load
     # Load with 4-bit precision and automatic SSD offloading
     teacher_model = AutoModelForCausalLM.from_pretrained(
         teacher_name,
         quantization_config=quantization_config,
         device_map="auto",                     # Changed from {"": "xpu"} to allow spilling
+        max_memory=max_memory_mapping,         # Enforce the RAM cap
         offload_folder=offload_dir,            # Explicitly route overflow to the SSD
-        trust_remote_code=True
+        low_cpu_mem_usage=True,      # Reduce CPU memory spike
+        trust_remote_code=True        
     )
     teacher_model.eval()
+    
+    logging.info("Compiling models for XPU (this may take a few minutes)...")
+    try:
+        teacher_model = torch.compile(teacher_model, backend="inductor")
+        encoder_model = torch.compile(encoder_model, backend="inductor")
+        logging.info("Compilation successful.")
+    except Exception as e:
+        logging.error(f"Torch compilation failed (this is optional, proceeding anyway): {e}")
 
     # 3. Process Chunked .pt Files
     pt_files = glob.glob(str(input_dir / "*.pt"))
@@ -87,10 +111,19 @@ def main():
         logging.warning(f"No .pt files found in {input_dir}. Ensure dataset_preparation.py has been run.")
         return
 
-    batch_size = 4
+    batch_size = 1
     max_new_tokens = 256
 
     for file_path in pt_files:
+        # Define where the output should be
+        out_file = output_dir / f"distilled_{Path(file_path).name}"
+        
+        # --- NEW RESUME LOGIC ---
+        if out_file.exists():
+            logging.info(f"Skipping {Path(file_path).name} - already processed.")
+            continue
+        # ------------------------
+        
         logging.info(f"Processing file: {file_path}")
         try:
             # Shape: [chunk_size, seq_len]
@@ -109,6 +142,14 @@ def main():
 
         for i in range(0, num_samples, batch_size):
             batch_input_ids = data_chunk[i:i+batch_size].to(device)
+            
+            # --- ADD THIS: Create an Attention Mask ---
+            # Create a mask of 1s for valid tokens, 0s for padding
+            # We assume your pad_token_id is known
+            pad_token_id = teacher_tokenizer.pad_token_id
+            attention_mask = (batch_input_ids != pad_token_id).long().to(device)
+            # ------------------------------------------
+            
             input_len = batch_input_ids.shape[1]
 
             # A. Generate teacher response text tokens
@@ -116,6 +157,7 @@ def main():
                 outputs = teacher_model.generate(
                     input_ids=batch_input_ids,
                     max_new_tokens=max_new_tokens,
+                    attention_mask=attention_mask, # <--- The model now respects your left-padding
                     pad_token_id=teacher_tokenizer.pad_token_id,
                     eos_token_id=teacher_tokenizer.eos_token_id,
                     do_sample=False
@@ -164,6 +206,12 @@ def main():
             # D. Aggressive VRAM cleanup
             del batch_input_ids, outputs, qwen_generated_tokens, encoder_inputs, encoder_outputs, cls_embeddings, concept_vectors
             clear_memory()
+            
+            # --- ADD THIS: Progress Tracker ---
+            processed_in_file = i + batch_size
+            percent = (processed_in_file / num_samples) * 100
+            logging.info(f"Progress: {percent:.2f}% | Current Item: {processed_in_file}/{num_samples}")
+            # ----------------------------------
 
         if len(all_input_tokens) > 0:
             # Construct the distilled binary mapping matrix
