@@ -39,24 +39,17 @@ DATASET_QUEUE = {
         "Infatoshi/kernelbench-mega-traces",
         "Roman1111111/gemini-3.1-pro-hard-high-reasoning",
         "PhysEdit/pawbench-gemini-expansion-20260619",
-        "TTS-AGI/dramabox-gemini-finetune",
         "mfielding92/gemini-3.1-pro-2048-reasoning-1100x",
-        "benchflow/skillsbench-leaderboard",
-        "evaleval/EEE_datastore"
     ],
 
     # 2. Massive General Knowledge, Instruction Following, & Creative Core
     "general_knowledge": [
         "HuggingFaceFW/fineweb-edu",
-        "HuggingFaceH4/ultrafeedback_clean",
-        "technium/OpenHermes-2.5",
         "KingNish/reasoning-base-20k"
     ],
 
     # 3. Code Syntax & Language Grammar Rules (For the JEPA World Model)
     "code_mechanics": [
-        "bigcode/starcoder2-instruct",
-        "iamtarun/python-execution-traces",
         "m-a-p/CodeFeedback-Filtered-Instruction"
     ]
 }
@@ -83,7 +76,34 @@ def stringify_complex(obj):
             return str(obj)
     return str(obj)
 
-def extract_text_pair(row, dataset_name):
+def find_key_recursive(data, target_key):
+    if isinstance(data, dict):
+        if target_key in data:
+            return data[target_key]
+        for key, value in data.items():
+            result = find_key_recursive(value, target_key)
+            if result is not None:
+                return result
+    elif isinstance(data, list):
+        for item in data:
+            result = find_key_recursive(item, target_key)
+            if result is not None:
+                return result
+    return None
+
+def extract_all_strings(data):
+    strings = []
+    if isinstance(data, str):
+        strings.append(data)
+    elif isinstance(data, dict):
+        for val in data.values():
+            strings.extend(extract_all_strings(val))
+    elif isinstance(data, list):
+        for item in data:
+            strings.extend(extract_all_strings(item))
+    return strings
+
+def extract_qa_pair(row, dataset_name):
     """
     Polymorphic parser to extract prompt/response pairs from diverse dataset schemas.
     Returns (prompt: str, response: str) or (None, None) if unavailable.
@@ -91,41 +111,38 @@ def extract_text_pair(row, dataset_name):
     prompt, response = None, None
 
     try:
-        # Common schemas
-        if "messages" in row:
-            messages = row["messages"]
-            if isinstance(messages, list) and len(messages) >= 2:
-                # E.g. [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
-                prompt_parts = []
-                for msg in messages:
-                    if not isinstance(msg, dict): continue
-                    role = str(msg.get("role", "")).lower()
-                    content = stringify_complex(msg.get("content", ""))
-                    if role in ["system", "user", "human", "prompter"]:
-                        prompt_parts.append(f"{role}: {content}")
-                    elif role in ["assistant", "bot", "model"]:
-                        response = content
-                        break
-                if prompt_parts and response:
-                    prompt = "\n".join(prompt_parts)
-                    return prompt, response
+        # Aggressive recursive search for 'messages' or 'conversations'
+        messages = find_key_recursive(row, "messages")
+        if not messages:
+            messages = find_key_recursive(row, "conversations")
 
-        if "conversations" in row:
-            conversations = row["conversations"]
-            if isinstance(conversations, list) and len(conversations) >= 2:
-                prompt_parts = []
-                for conv in conversations:
-                    if not isinstance(conv, dict): continue
-                    from_role = str(conv.get("from", "")).lower()
-                    val = stringify_complex(conv.get("value", ""))
-                    if from_role in ["human", "user", "system"]:
-                        prompt_parts.append(f"{from_role}: {val}")
-                    elif from_role in ["gpt", "assistant", "bot"]:
-                        response = val
-                        break
-                if prompt_parts and response:
-                    prompt = "\n".join(prompt_parts)
-                    return prompt, response
+        if messages and isinstance(messages, list) and len(messages) >= 2:
+            prompt_parts = []
+            response_content = None
+
+            # Find the first user message
+            for msg in messages:
+                if not isinstance(msg, dict): continue
+                role = str(msg.get("role", msg.get("from", ""))).lower()
+                content = stringify_complex(msg.get("content", msg.get("value", "")))
+
+                if role in ["system", "user", "human", "prompter"] and not prompt_parts:
+                    prompt_parts.append(f"{role}: {content}")
+                    break # just get the first one for prompt
+
+            # Find the last assistant message
+            for msg in reversed(messages):
+                if not isinstance(msg, dict): continue
+                role = str(msg.get("role", msg.get("from", ""))).lower()
+                content = stringify_complex(msg.get("content", msg.get("value", "")))
+
+                if role in ["assistant", "bot", "model", "gpt"]:
+                    response_content = content
+                    break
+
+            if prompt_parts and response_content:
+                prompt = "\n".join(prompt_parts)
+                return prompt, response_content
 
         # Instruction / Output
         if "instruction" in row and "output" in row:
@@ -151,10 +168,21 @@ def extract_text_pair(row, dataset_name):
                 response = text[mid:]
                 return prompt, response
 
+        # Ultimate fallback: Find the longest string in the entire row
+        all_strings = extract_all_strings(row)
+        if all_strings:
+            longest_string = max(all_strings, key=len)
+            if len(longest_string) > 10:
+                mid = len(longest_string) // 2
+                prompt = longest_string[:mid]
+                response = longest_string[mid:]
+                return prompt, response
+
     except Exception as e:
         logging.debug(f"Failed to parse row: {e}")
 
     return None, None
+
 
 def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
     save_path = Path(save_dir)
@@ -208,57 +236,70 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
             max_rows = 50000 if dataset_name == "HuggingFaceFW/fineweb-edu" else 250000
             rows_processed = 0
 
-            for row in ds:
-                if rows_processed >= max_rows:
-                    break
+            try:
+                # Wrap the iterator to catch ArrowInvalid and other dataset-level errors
+                ds_iterator = iter(ds)
+                while True:
+                    if rows_processed >= max_rows:
+                        break
 
-                try:
-                    prompt, response = extract_text_pair(row, dataset_name)
-                    if not prompt or not response:
+                    try:
+                        row = next(ds_iterator)
+                    except StopIteration:
+                        break
+                    except Exception as e:
+                        logging.error(f"Dataset {dataset_name} iterator crashed: {e}. Moving to next dataset.")
+                        break
+
+                    try:
+                        prompt, response = extract_qa_pair(row, dataset_name)
+                        if not prompt or not response:
+                            continue
+
+                        # 1 & 2: Tokenize input and response
+                        input_tokens = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)["input_ids"].squeeze(0)
+                        qwen_tokens = tokenizer(response, return_tensors="pt", truncation=True, max_length=2048)["input_ids"].squeeze(0)
+
+                        # Skip empty sequences
+                        if input_tokens.numel() == 0 or qwen_tokens.numel() == 0:
+                            continue
+
+                        # 3: Compute target concept on XPU
+                        enc_inputs = encoder_tokenizer(response, return_tensors="pt", truncation=True, max_length=512, padding=True).to(device)
+
+                        with torch.no_grad():
+                            enc_outputs = encoder_model(**enc_inputs)
+                            cls_embedding = enc_outputs.last_hidden_state[:, 0, :]
+                            target_concept = F.normalize(cls_embedding, p=2, dim=1).squeeze(0).cpu()
+
+                        buffer.append({
+                            "input_tokens": input_tokens.cpu(),
+                            "qwen_tokens": qwen_tokens.cpu(),
+                            "target_concept": target_concept
+                        })
+                        rows_processed += 1
+
+                        if len(buffer) >= chunk_size:
+                            shard_path = save_path / f"{domain}_{safe_name}_{chunk_id}.pt"
+                            torch.save(buffer, shard_path)
+                            elapsed = time.time() - start_time
+                            throughput = len(buffer) / elapsed if elapsed > 0 else 0
+                            logging.info(f"Saved {shard_path} with {len(buffer)} items. Speed: {throughput:.2f} samples/sec")
+                            start_time = time.time()
+                            buffer = []
+                            chunk_id += 1
+
+                            # Clear VRAM cache hook
+                            if hasattr(torch.xpu, 'empty_cache'):
+                                torch.xpu.empty_cache()
+                            elif torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
+                    except Exception as e:
+                        logging.warning(f"Error processing row in {dataset_name}: {e}")
                         continue
-
-                    # 1 & 2: Tokenize input and response
-                    input_tokens = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)["input_ids"].squeeze(0)
-                    qwen_tokens = tokenizer(response, return_tensors="pt", truncation=True, max_length=2048)["input_ids"].squeeze(0)
-
-                    # Skip empty sequences
-                    if input_tokens.numel() == 0 or qwen_tokens.numel() == 0:
-                        continue
-
-                    # 3: Compute target concept on XPU
-                    enc_inputs = encoder_tokenizer(response, return_tensors="pt", truncation=True, max_length=512, padding=True).to(device)
-
-                    with torch.no_grad():
-                        enc_outputs = encoder_model(**enc_inputs)
-                        cls_embedding = enc_outputs.last_hidden_state[:, 0, :]
-                        target_concept = F.normalize(cls_embedding, p=2, dim=1).squeeze(0).cpu()
-
-                    buffer.append({
-                        "input_tokens": input_tokens.cpu(),
-                        "qwen_tokens": qwen_tokens.cpu(),
-                        "target_concept": target_concept
-                    })
-                    rows_processed += 1
-
-                    if len(buffer) >= chunk_size:
-                        shard_path = save_path / f"{domain}_{safe_name}_{chunk_id}.pt"
-                        torch.save(buffer, shard_path)
-                        elapsed = time.time() - start_time
-                        throughput = len(buffer) / elapsed if elapsed > 0 else 0
-                        logging.info(f"Saved {shard_path} with {len(buffer)} items. Speed: {throughput:.2f} samples/sec")
-                        start_time = time.time()
-                        buffer = []
-                        chunk_id += 1
-
-                        # Clear VRAM cache hook
-                        if hasattr(torch.xpu, 'empty_cache'):
-                            torch.xpu.empty_cache()
-                        elif torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
-                except Exception as e:
-                    logging.warning(f"Error processing row in {dataset_name}: {e}")
-                    continue
+            except Exception as e:
+                logging.error(f"Critical error during {dataset_name} processing: {e}")
 
             # Save any remaining in buffer
             if buffer:
