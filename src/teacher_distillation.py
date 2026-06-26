@@ -74,25 +74,20 @@ def main():
             teacher_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         
     # 1. Define memory constraints (Set to ~20GB to stay safe)
-    # 0 represents your XPU/GPU, "cpu" represents system RAM
     max_memory_mapping = {0: "30GiB", "cpu": "15GiB"}
     offload_dir = r"F:\JEPA_Model\offload_cache"
     os.makedirs(offload_dir, exist_ok=True)
     
-    # Ensure the SSD offload directory exists
-    offload_dir = r"F:\JEPA_Model\offload_cache"
-    os.makedirs(offload_dir, exist_ok=True)
     print(f"DEBUG: Max memory settings: {max_memory_mapping}")
 
     # 2. Updated Teacher Model Load
-    # Load with 4-bit precision and automatic SSD offloading
     teacher_model = AutoModelForCausalLM.from_pretrained(
         teacher_name,
         quantization_config=quantization_config,
         device_map="auto",                     # Changed from {"": "xpu"} to allow spilling
         max_memory=max_memory_mapping,         # Enforce the RAM cap
         offload_folder=offload_dir,            # Explicitly route overflow to the SSD
-        low_cpu_mem_usage=True,      # Reduce CPU memory spike
+        low_cpu_mem_usage=True,                # Reduce CPU memory spike
         trust_remote_code=True        
     )
     teacher_model.eval()
@@ -112,7 +107,7 @@ def main():
         return
 
     batch_size = 1
-    max_new_tokens = 256
+    max_new_tokens = 65536  # Expanded ceiling to support ultra-long agent reasoning traces
 
     for file_path in pt_files:
         # Define where the output should be
@@ -144,8 +139,6 @@ def main():
             batch_input_ids = data_chunk[i:i+batch_size].to(device)
             
             # --- ADD THIS: Create an Attention Mask ---
-            # Create a mask of 1s for valid tokens, 0s for padding
-            # We assume your pad_token_id is known
             pad_token_id = teacher_tokenizer.pad_token_id
             attention_mask = (batch_input_ids != pad_token_id).long().to(device)
             # ------------------------------------------
@@ -157,27 +150,17 @@ def main():
                 outputs = teacher_model.generate(
                     input_ids=batch_input_ids,
                     max_new_tokens=max_new_tokens,
-                    attention_mask=attention_mask, # <--- The model now respects your left-padding
+                    attention_mask=attention_mask, 
                     pad_token_id=teacher_tokenizer.pad_token_id,
                     eos_token_id=teacher_tokenizer.eos_token_id,
-                    do_sample=False
+                    do_sample=False,
+                    repetition_penalty=1.15,  # Discourages infinite loop repetitions (Scenario 0)
+                    cache_implementation="quantized",  # Quantize KV Cache to protect VRAM
+                    cache_config={"backend": "quanto", "nbits": 8}
                 )
 
             # Extract only the generated tokens (exclude the prompt)
             qwen_generated_tokens = outputs[:, input_len:]
-
-            # Pad generated tokens up to max_new_tokens to maintain rigid matrix shapes
-            if qwen_generated_tokens.shape[1] < max_new_tokens:
-                pad_len = max_new_tokens - qwen_generated_tokens.shape[1]
-                pad_tensor = torch.full(
-                    (qwen_generated_tokens.shape[0], pad_len),
-                    teacher_tokenizer.pad_token_id,
-                    dtype=qwen_generated_tokens.dtype,
-                    device=device
-                )
-                qwen_generated_tokens = torch.cat([qwen_generated_tokens, pad_tensor], dim=1)
-            else:
-                qwen_generated_tokens = qwen_generated_tokens[:, :max_new_tokens]
 
             # Decode to string format for the Concept Encoder
             qwen_generated_text = teacher_tokenizer.batch_decode(qwen_generated_tokens, skip_special_tokens=True)
@@ -198,13 +181,13 @@ def main():
                 # L2 Normalize the vectors for Cosine Similarity alignment in Phase 3
                 concept_vectors = F.normalize(cls_embeddings, p=2, dim=1)  # Target Shape: [Batch, 1024]
 
-            # C. Store the results locally on CPU to free up GPU VRAM
-            all_input_tokens.append(batch_input_ids.cpu())
-            all_target_concepts.append(concept_vectors.cpu())
-            all_qwen_tokens.append(qwen_generated_tokens.cpu())
+            # C. Store the results locally on CPU as unbatched 1D tensors to preserve unique lengths
+            all_input_tokens.append(batch_input_ids.squeeze(0).cpu())
+            all_target_concepts.append(concept_vectors.squeeze(0).cpu())
+            all_qwen_tokens.append(qwen_generated_tokens.squeeze(0).cpu())
 
             # D. Aggressive VRAM cleanup
-            del batch_input_ids, outputs, qwen_generated_tokens, encoder_inputs, encoder_outputs, cls_embeddings, concept_vectors
+            del batch_input_ids, attention_mask, outputs, qwen_generated_tokens, encoder_inputs, encoder_outputs, cls_embeddings, concept_vectors
             clear_memory()
             
             # --- ADD THIS: Progress Tracker ---
@@ -214,16 +197,16 @@ def main():
             # ----------------------------------
 
         if len(all_input_tokens) > 0:
-            # Construct the distilled binary mapping matrix
+            # Construct the distilled structure as a dictionary of lists to avoid tensor shape mismatch crashes
             distilled_matrix = {
-                "input_tokens": torch.cat(all_input_tokens, dim=0),       # Shape: [chunk_size, seq_len]
-                "target_concept": torch.cat(all_target_concepts, dim=0),  # Shape: [chunk_size, 1024]
-                "qwen_tokens": torch.cat(all_qwen_tokens, dim=0)          # Shape: [chunk_size, 256]
+                "input_tokens": all_input_tokens,      # List of 1D tensors (varying length)
+                "target_concept": all_target_concepts,  # List of 1D tensors (shape: [1024])
+                "qwen_tokens": all_qwen_tokens          # List of 1D tensors (varying length)
             }
 
             out_file = output_dir / f"distilled_{Path(file_path).name}"
             torch.save(distilled_matrix, out_file)
-            logging.info(f"Saved distilled matrices to {out_file}. Concept Vector Shape: {distilled_matrix['target_concept'].shape}")
+            logging.info(f"Saved distilled lists to {out_file}.")
 
             del distilled_matrix, all_input_tokens, all_target_concepts, all_qwen_tokens
             clear_memory()

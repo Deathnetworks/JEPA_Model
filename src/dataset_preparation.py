@@ -22,44 +22,47 @@ def setup_device():
     logging.info(f"Targeting native Intel GPU compute via device: {device}")
     return device
 
-def prepare_text_from_item(item, dataset_name):
+def prepare_text_from_item(item, dataset_name, tokenizer):
     """
-    Extracts and formats text appropriately from different dataset schemas.
+    Extracts the prompt and formats it using the model's native chat template.
+    We DO NOT include the Assistant's answer because we want the Teacher model 
+    to generate its own fresh reasoning trace.
     """
-    text = ""
+    messages = []
+    
     if dataset_name == "AlicanKiraz0/Agentic-Chain-of-Thought-Coding-SFT-Dataset":
-        system = item.get('system', '')
-        user = item.get('user', '')
-        assistant = item.get('assistant', '')
-        text = f"System: {system}\n\nUser: {user}\n\nAssistant: {assistant}"
-    elif dataset_name == "TheAgenticAI/Agentic-Reasoning":
-        system = item.get('system', '')
-        text = f"System: {system}\n\n"
+        messages.append({"role": "system", "content": item.get('system', '')})
+        messages.append({"role": "user", "content": item.get('user', '')})
+        
+    elif dataset_name in ["TheAgenticAI/Agentic-Reasoning", "teknium/OpenHermes-2.5"]:
+        system = item.get('system', item.get('system_prompt', ''))
+        if system:
+            messages.append({"role": "system", "content": system})
+            
         conversations = item.get('conversations', [])
+        # Only grab the User's prompt, ignore the Assistant's pre-written answer
         for conv in conversations:
-            role = conv.get('from', '')
-            value = conv.get('value', '')
-            text += f"{role.capitalize()}: {value}\n\n"
+            if conv.get('from', '') == 'human':
+                messages.append({"role": "user", "content": conv.get('value', '')})
+                break # We only need the first prompt for generation
+                
     elif dataset_name == "ise-uiuc/Magicoder-OSS-Instruct-75K":
-        problem = item.get('problem', '')
-        solution = item.get('solution', '')
-        text = f"System: You are an exceptionally intelligent coding assistant.\n\nUser: {problem}\n\nAssistant: {solution}"
-    elif dataset_name == "teknium/OpenHermes-2.5":
-        system = item.get('system_prompt', '')
-        text = f"System: {system}\n\n"
-        conversations = item.get('conversations', [])
-        for conv in conversations:
-            role = conv.get('from', '')
-            value = conv.get('value', '')
-            text += f"{role.capitalize()}: {value}\n\n"
-    return text.strip()
+        messages.append({"role": "system", "content": "You are an exceptionally intelligent coding assistant."})
+        messages.append({"role": "user", "content": item.get('problem', '')})
+
+    # Let the tokenizer wrap the text in the correct <|im_start|> tags
+    # add_generation_prompt=True adds the final <|im_start|>assistant tag to trigger generation
+    if messages:
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        return text.strip()
+    return ""
 
 def process_and_save_datasets(
     model_name="Jackrong/Qwopus3.6-27B-v2",
     save_dir=r"F:\JEPA_Model\data",
-    seq_len=4096,
-    chunk_size=10,
-    max_samples_per_dataset=25000
+    chunk_size=1,
+    max_samples_per_dataset=25000,
+    max_seq_len=4096 # Updated to 4K to capture complex instructions
 ):
     # Path configuration
     save_path = Path(save_dir)
@@ -75,7 +78,7 @@ def process_and_save_datasets(
 
     logging.info(f"Loading tokenizer for {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer.padding_side = "left" # <--- ADD THIS
+    tokenizer.padding_side = "left" 
 
     # Ensure pad token exists
     if tokenizer.pad_token_id is None:
@@ -109,37 +112,30 @@ def process_and_save_datasets(
             if max_samples_per_dataset is not None and samples_processed >= max_samples_per_dataset:
                 break
 
-            text = prepare_text_from_item(item, dataset_name)
+            text = prepare_text_from_item(item, dataset_name, tokenizer)
             if not text:
                 continue
 
-            # Tokenize without truncation to preserve the entire reasoning chain
+            # Tokenize without truncation
             tokens = tokenizer(
                 text,
                 truncation=False,
                 return_tensors="pt"
             )
 
-            input_ids = tokens["input_ids"].squeeze(0) # 1D tensor of variable length
+            input_ids = tokens["input_ids"].squeeze(0) # 1D tensor
 
-            # Chunking into multiple seq_len segments
-            for i in range(0, len(input_ids), seq_len):
-                chunk = input_ids[i:i+seq_len]
-                if len(chunk) < seq_len:
-                    # Pad to match standard seq_len for continuous tensor architecture
-                    pad_len = seq_len - len(chunk)
-                    pad_tensor = torch.full((pad_len,), tokenizer.pad_token_id, dtype=torch.long)
-                    chunk = torch.cat([pad_tensor, chunk])
+            # HARD LIMIT FILTER: Skip prompts that are too long for the Arc B70 VRAM
+            if len(input_ids) > max_seq_len:
+                logging.warning(f"Skipping sample: Prompt length {len(input_ids)} exceeds safe memory budget ({max_seq_len}).")
+                continue
 
-                # Keep CPU tensors for saving to disk, move to XPU during training DataLoader
-                buffer.append(chunk)
-
+            # Append the raw, unpadded, variable-length tensor directly
+            buffer.append(input_ids)
             samples_processed += 1
 
-            # Periodically write to disk
+            # Periodically write to disk (Save as a LIST of tensors)
             if len(buffer) >= chunk_size:
-                tensor_chunk = torch.stack(buffer) # [chunk_size, seq_len]
-
                 if dataset_name in ["AlicanKiraz0/Agentic-Chain-of-Thought-Coding-SFT-Dataset", "TheAgenticAI/Agentic-Reasoning"]:
                     prefix = "agentic_"
                 elif dataset_name == "ise-uiuc/Magicoder-OSS-Instruct-75K":
@@ -150,18 +146,16 @@ def process_and_save_datasets(
                     prefix = "unknown_"
 
                 out_file = save_path / f"{prefix}set_{file_index}.pt"
-
-                # We save locally as .pt which acts as a cache for standard DataLoader
-                torch.save(tensor_chunk, out_file)
-                logging.info(f"Saved {out_file} with shape {tensor_chunk.shape} ({samples_processed} source items processed)")
+                
+                # Save the list of variable-length tensors directly
+                torch.save(buffer, out_file)
+                logging.info(f"Saved {out_file} with {len(buffer)} items ({samples_processed} source items processed)")
 
                 buffer = []
                 file_index += 1
 
         # Flush remaining buffer
         if buffer:
-            tensor_chunk = torch.stack(buffer)
-
             if dataset_name in ["AlicanKiraz0/Agentic-Chain-of-Thought-Coding-SFT-Dataset", "TheAgenticAI/Agentic-Reasoning"]:
                 prefix = "agentic_"
             elif dataset_name == "ise-uiuc/Magicoder-OSS-Instruct-75K":
@@ -172,12 +166,11 @@ def process_and_save_datasets(
                 prefix = "unknown_"
 
             out_file = save_path / f"{prefix}set_{file_index}.pt"
-            torch.save(tensor_chunk, out_file)
-            logging.info(f"Saved final {out_file} with shape {tensor_chunk.shape}")
+            torch.save(buffer, out_file)
+            logging.info(f"Saved final {out_file} with {len(buffer)} items")
 
     # Mark as completed
     marker_file.touch()
-
 
 if __name__ == "__main__":
     process_and_save_datasets()
