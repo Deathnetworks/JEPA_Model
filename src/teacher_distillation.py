@@ -2,11 +2,17 @@ import os
 import gc
 import glob
 import logging
+import sys
+import time
+import json
+import threading
+import statistics
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel, BitsAndBytesConfig, TextIteratorStreamer
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -33,6 +39,49 @@ def clear_memory():
     gc.collect()
     if hasattr(torch, "xpu") and hasattr(torch.xpu, "empty_cache"):
         torch.xpu.empty_cache()
+
+
+def get_dataset_type(filename):
+    """Extract the dataset type from the filename. e.g. distilled_agentic_set_0.pt -> agentic"""
+    name = str(Path(filename).name)
+    parts = name.split('_')
+    # If the file is like distilled_agentic_set_0.pt, parts[1] is the type
+    if len(parts) >= 2:
+        if parts[0] == "distilled":
+            return parts[1]
+        else:
+            return parts[0]
+    return "unknown"
+
+def load_stats(output_dir):
+    stats_file = output_dir / "generation_stats.json"
+    if stats_file.exists():
+        with open(stats_file, 'r') as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return {}
+    return {}
+
+def save_stats(output_dir, stats):
+    stats_file = output_dir / "generation_stats.json"
+    with open(stats_file, 'w') as f:
+        json.dump(stats, f, indent=4)
+
+def get_median_ratio(stats, dataset_type):
+    if dataset_type not in stats or "ratios" not in stats[dataset_type] or len(stats[dataset_type]["ratios"]) == 0:
+        return 2.0
+    return statistics.median(stats[dataset_type]["ratios"])
+
+def update_stats(stats, output_dir, dataset_type, input_len, output_len):
+    if dataset_type not in stats:
+        stats[dataset_type] = {"ratios": []}
+    ratio = output_len / input_len if input_len > 0 else 2.0
+    stats[dataset_type]["ratios"].append(ratio)
+    # keep only last 100 ratios to have a moving median
+    if len(stats[dataset_type]["ratios"]) > 100:
+        stats[dataset_type]["ratios"] = stats[dataset_type]["ratios"][-100:]
+    save_stats(output_dir, stats)
 
 def main():
     device = setup_device()
@@ -145,22 +194,85 @@ def main():
             
             input_len = batch_input_ids.shape[1]
 
-            # A. Generate teacher response text tokens
-            with torch.no_grad():
-                outputs = teacher_model.generate(
-                    input_ids=batch_input_ids,
-                    max_new_tokens=max_new_tokens,
-                    attention_mask=attention_mask, 
-                    pad_token_id=teacher_tokenizer.pad_token_id,
-                    eos_token_id=teacher_tokenizer.eos_token_id,
-                    do_sample=False,
-                    repetition_penalty=1.15,  # Discourages infinite loop repetitions (Scenario 0)
-                    cache_implementation="quantized",  # Quantize KV Cache to protect VRAM
-                    cache_config={"backend": "quanto", "nbits": 8}
-                )
+            # --- ADD THIS: Load Stats for the dataset ---
+            dataset_type = get_dataset_type(file_path)
+            stats = load_stats(output_dir)
+            median_ratio = get_median_ratio(stats, dataset_type)
+            est_output_len = int(input_len * median_ratio)
+            # --------------------------------------------
+
+            # A. Generate teacher response text tokens with Streaming & ETA tracking
+            streamer = TextIteratorStreamer(teacher_tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+            generation_kwargs = dict(
+                input_ids=batch_input_ids,
+                max_new_tokens=max_new_tokens,
+                attention_mask=attention_mask,
+                pad_token_id=teacher_tokenizer.pad_token_id,
+                eos_token_id=teacher_tokenizer.eos_token_id,
+                do_sample=False,
+                repetition_penalty=1.15,
+                cache_implementation="quantized",
+                cache_config={"backend": "quanto", "nbits": 8},
+                streamer=streamer
+            )
+
+            output_container = []
+            def thread_generate():
+                with torch.no_grad():
+                    output_tensor = teacher_model.generate(**generation_kwargs)
+                    output_container.append(output_tensor)
+
+            thread = threading.Thread(target=thread_generate)
+            thread.start()
+
+            # --- ETA Tracking Loop ---
+            start_time = time.time()
+            tokens_generated = 0
+
+            for text_chunk in streamer:
+                # TextIteratorStreamer yields strings.
+                # We can approximate token count by re-tokenizing or a simpler character heuristic.
+                # However, re-tokenizing every chunk might be slow, so we do it roughly.
+                # A more precise way is tokenizing the new chunk:
+                # chunk_len = len(teacher_tokenizer.encode(text_chunk, add_special_tokens=False))
+                # For safety and speed, we will tokenize the yielded string to get accurate counts:
+                chunk_tokens = len(teacher_tokenizer.encode(text_chunk, add_special_tokens=False))
+                tokens_generated += chunk_tokens
+
+                elapsed = time.time() - start_time
+                if elapsed > 0:
+                    speed = tokens_generated / elapsed
+                    # If we generated more than estimated, clamp ETA to 0 but show actual tokens
+                    remaining_tokens = max(0, est_output_len - tokens_generated)
+                    eta_seconds = int(remaining_tokens / speed) if speed > 0 else 0
+
+                    mins, secs = divmod(eta_seconds, 60)
+                    hours, mins = divmod(mins, 60)
+
+                    if hours > 0:
+                        eta_str = f"{hours:02d}h {mins:02d}m {secs:02d}s"
+                    else:
+                        eta_str = f"{mins:02d}m {secs:02d}s"
+
+                    # Output Format: [agentic] Input: 450 tk | Gen: 125/2450 tk (Est) | Speed: 11.2 tk/s | ETA: 03m 27s
+                    sys.stdout.write(f"\r[{dataset_type}] Input: {input_len} tk | Gen: {tokens_generated}/{est_output_len} tk (Est) | Speed: {speed:.1f} tk/s | ETA: {eta_str}")
+                    sys.stdout.flush()
+
+            # Wait for thread to cleanly finish and retrieve full tensor
+            thread.join()
+            sys.stdout.write("\n")  # Newline after generation completes
+
+            outputs = output_container[0]
+            # ---------------------------
 
             # Extract only the generated tokens (exclude the prompt)
             qwen_generated_tokens = outputs[:, input_len:]
+
+            # --- Update Stats ---
+            output_len = qwen_generated_tokens.shape[1]
+            update_stats(stats, output_dir, dataset_type, input_len, output_len)
+            # --------------------
 
             # Decode to string format for the Concept Encoder
             qwen_generated_text = teacher_tokenizer.batch_decode(qwen_generated_tokens, skip_special_tokens=True)
