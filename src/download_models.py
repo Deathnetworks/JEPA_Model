@@ -42,8 +42,9 @@ DATASET_QUEUE = {
         "Infatoshi/kernelbench-mega-traces",
         "Roman1111111/gemini-3.1-pro-hard-high-reasoning",
         "PhysEdit/pawbench-gemini-expansion-20260619",
-        "TTS-AGI/dramabox-gemini-finetune",
         "mfielding92/gemini-3.1-pro-2048-reasoning-1100x",
+        "rajpurkar/squad",
+        "google/boolq",
         "benchflow/skillsbench-leaderboard",
         "evaleval/EEE_datastore"
     ],
@@ -53,14 +54,37 @@ DATASET_QUEUE = {
         "HuggingFaceFW/fineweb-edu",
         "HuggingFaceH4/ultrafeedback_clean",
         "technium/OpenHermes-2.5",
-        "KingNish/reasoning-base-20k"
+        "KingNish/reasoning-base-20k",
+        "Salesforce/wikitext",
+        "banned-historical-archives/banned-historical-archives",
+        "allenai/c4",
+        "stanfordnlp/imdb",
+        "legacy-datasets/wikipedia",
+        "bookcorpus/bookcorpus",
+        "fse/paranmt-300",
+        "Skylion007/openwebtext",
+        "evaluate-metric/xnli",
+        "liwu/MNBVC"
     ],
 
     # 3. Code Syntax & Language Grammar Rules (For the JEPA World Model)
     "code_mechanics": [
+        "m-a-p/CodeFeedback-Filtered-Instruction",
+        "deepmind/code_contests",
+        "code-search-net/code_search_net",
         "bigcode/starcoder2-instruct",
         "iamtarun/python-execution-traces",
-        "m-a-p/CodeFeedback-Filtered-Instruction"
+        "bigcode/the-stack",
+        "bookcorpus/bookcorpus",
+        "Salesforce/wikisql",
+        "gaianet/learn-rust",
+        "semeru/code-code-translation-java-csharp",
+        "MehdiFe/csharp-instruction-Dataset",
+        "microsoft/LCC_csharp",
+        "AlgorithmicResearchGroup/arxiv_cplusplus_research_code",
+        "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k",
+        "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k-Alpaca-GPT4",
+        "bh2821/LightNovel5000"        
     ]
 }
 

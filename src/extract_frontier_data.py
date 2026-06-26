@@ -40,17 +40,48 @@ DATASET_QUEUE = {
         "Roman1111111/gemini-3.1-pro-hard-high-reasoning",
         "PhysEdit/pawbench-gemini-expansion-20260619",
         "mfielding92/gemini-3.1-pro-2048-reasoning-1100x",
+        "rajpurkar/squad",
+        "google/boolq",
+        "benchflow/skillsbench-leaderboard",
+        "evaleval/EEE_datastore"
     ],
 
     # 2. Massive General Knowledge, Instruction Following, & Creative Core
     "general_knowledge": [
         "HuggingFaceFW/fineweb-edu",
-        "KingNish/reasoning-base-20k"
+        "HuggingFaceH4/ultrafeedback_clean",
+        "technium/OpenHermes-2.5",
+        "KingNish/reasoning-base-20k",
+        "Salesforce/wikitext",
+        "banned-historical-archives/banned-historical-archives",
+        "allenai/c4",
+        "stanfordnlp/imdb",
+        "legacy-datasets/wikipedia",
+        "bookcorpus/bookcorpus",
+        "fse/paranmt-300",
+        "Skylion007/openwebtext",
+        "evaluate-metric/xnli",
+        "liwu/MNBVC"
     ],
 
     # 3. Code Syntax & Language Grammar Rules (For the JEPA World Model)
     "code_mechanics": [
-        "m-a-p/CodeFeedback-Filtered-Instruction"
+        "m-a-p/CodeFeedback-Filtered-Instruction",
+        "deepmind/code_contests",
+        "code-search-net/code_search_net",
+        "bigcode/starcoder2-instruct",
+        "iamtarun/python-execution-traces",
+        "bigcode/the-stack",
+        "bookcorpus/bookcorpus",
+        "Salesforce/wikisql",
+        "gaianet/learn-rust",
+        "semeru/code-code-translation-java-csharp",
+        "MehdiFe/csharp-instruction-Dataset",
+        "microsoft/LCC_csharp",
+        "AlgorithmicResearchGroup/arxiv_cplusplus_research_code",
+        "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k",
+        "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k-Alpaca-GPT4",
+        "bh2821/LightNovel5000"        
     ]
 }
 
@@ -157,6 +188,14 @@ def extract_qa_pair(row, dataset_name):
 
         if "prompt" in row and "completion" in row:
             return stringify_complex(row["prompt"]), stringify_complex(row["completion"])
+            
+        # Add this rule inside your extract_qa_pair function in extract_frontier_data.py
+        if "zh" in row and "en" in row:
+            return stringify_complex(row["zh"]), stringify_complex(row["en"])
+
+        if "source" in row and "target" in row:
+            # Verify if it's the Chinese translation partition
+            return stringify_complex(row["source"]), stringify_complex(row["target"])
 
         # Text only (fineweb-edu, etc.)
         if "text" in row:
@@ -216,6 +255,9 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
             load_args = {"path": dataset_name, "split": "train", "streaming": True}
             if dataset_name == "HuggingFaceFW/fineweb-edu":
                 load_args["name"] = "sample-10BT"
+            # Add this specific check for MNBVC
+            elif dataset_name == "liwu/MNBVC":
+                load_args["name"] = "web_novel" # or "novel" based on your preference
 
             try:
                 ds = load_dataset(**load_args)
@@ -233,8 +275,10 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
 
             # Limit total rows to avoid infinite loops on huge streaming datasets if we don't want to process everything
             # Set limits based on domain and dataset size
-            if dataset_name == "HuggingFaceFW/fineweb-edu":
+            if domain == "general_knowledge":
                 max_rows = 20_000_000
+            elif dataset_name == "wdndev/webnovel-chinese":
+                max_rows = 5_000_000   # Solid base for Chinese prose structures
             elif domain == "frontier_traces":
                 max_rows = 500_000
             else:
