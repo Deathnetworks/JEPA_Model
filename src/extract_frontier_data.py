@@ -232,9 +232,35 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
                     continue
 
             # Limit total rows to avoid infinite loops on huge streaming datasets if we don't want to process everything
-            # Let's say process up to 100k pairs for massive sets like fineweb, others bounded by natural length or 1M.
-            max_rows = 50000 if dataset_name == "HuggingFaceFW/fineweb-edu" else 250000
+            # Set limits based on domain and dataset size
+            if dataset_name == "HuggingFaceFW/fineweb-edu":
+                max_rows = 1_500_000
+            elif domain == "frontier_traces":
+                max_rows = 5_000_000
+            else:
+                max_rows = 1_000_000
+
             rows_processed = 0
+
+            # Check for existing shards to resume
+            existing_shards = list(save_path.glob(f"{domain}_{safe_name}_*.pt"))
+            if existing_shards:
+                # Extract chunk IDs
+                chunk_ids = []
+                for shard in existing_shards:
+                    match = re.search(r"_(\d+)\.pt$", shard.name)
+                    if match:
+                        chunk_ids.append(int(match.group(1)))
+
+                if chunk_ids:
+                    highest_chunk_id = max(chunk_ids)
+                    chunk_id = highest_chunk_id + 1
+                    rows_to_skip = chunk_id * chunk_size
+
+                    if rows_to_skip > 0:
+                        logging.info(f"Resuming {dataset_name}: Fast-forwarding {rows_to_skip} rows...")
+                        ds = ds.skip(rows_to_skip)
+                        rows_processed = rows_to_skip
 
             try:
                 # Wrap the iterator to catch ArrowInvalid and other dataset-level errors
