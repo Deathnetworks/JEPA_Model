@@ -1,4 +1,5 @@
 import os
+import time
 import re
 import json
 import logging
@@ -174,6 +175,7 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
     encoder_model = AutoModel.from_pretrained(encoder_id).to(device)
     encoder_model.eval()
 
+    start_time = time.time()
     for domain, datasets in DATASET_QUEUE.items():
         for dataset_name in datasets:
             logging.info(f"Starting ingestion for: {dataset_name} in domain: {domain}")
@@ -241,7 +243,10 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
                     if len(buffer) >= chunk_size:
                         shard_path = save_path / f"{domain}_{safe_name}_{chunk_id}.pt"
                         torch.save(buffer, shard_path)
-                        logging.info(f"Saved {shard_path} with {len(buffer)} items.")
+                        elapsed = time.time() - start_time
+                        throughput = len(buffer) / elapsed if elapsed > 0 else 0
+                        logging.info(f"Saved {shard_path} with {len(buffer)} items. Speed: {throughput:.2f} samples/sec")
+                        start_time = time.time()
                         buffer = []
                         chunk_id += 1
 
@@ -259,7 +264,10 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
             if buffer:
                 shard_path = save_path / f"{domain}_{safe_name}_{chunk_id}.pt"
                 torch.save(buffer, shard_path)
-                logging.info(f"Saved final {shard_path} with {len(buffer)} items.")
+                elapsed = time.time() - start_time
+                throughput = len(buffer) / elapsed if elapsed > 0 else 0
+                logging.info(f"Saved final {shard_path} with {len(buffer)} items. Speed: {throughput:.2f} samples/sec")
+                start_time = time.time()
 
             logging.info(f"Finished {dataset_name}. Total processed pairs: {rows_processed}")
 
