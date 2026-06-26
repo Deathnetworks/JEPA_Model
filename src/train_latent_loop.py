@@ -125,8 +125,24 @@ def train_loop(
     model = model.to(device)
     decoder = decoder.to(device)
 
+
+    if os.path.exists("jepa_engine.pth"):
+        try:
+            model.load_state_dict(torch.load("jepa_engine.pth", map_location=device, weights_only=True), strict=False)
+            logging.info("Successfully loaded pre-existing weights for jepa_engine.pth.")
+        except Exception as e:
+            logging.warning(f"Failed to load jepa_engine.pth: {e}")
+
+    if os.path.exists("latent_decoder.pth"):
+        try:
+            decoder.load_state_dict(torch.load("latent_decoder.pth", map_location=device, weights_only=True), strict=False)
+            logging.info("Successfully loaded pre-existing weights for latent_decoder.pth.")
+        except Exception as e:
+            logging.warning(f"Failed to load latent_decoder.pth: {e}")
+
     model.train()
     decoder.train()
+
 
     optimizer_grouped_parameters = [
         {"params": [p for n, p in model.named_parameters() if p.requires_grad]},
@@ -152,7 +168,7 @@ def train_loop(
         model, decoder, optimizer, dataloader, lr_scheduler
     )
 
-    checkpoint_dir = "checkpoint_latest"
+    checkpoint_dir = f"checkpoint_{curriculum_phase}"
     starting_epoch = 0
     starting_batch = 0
 
@@ -180,6 +196,7 @@ def train_loop(
     optimizer.zero_grad()
 
     global_mb_step = 0
+    start_time = time.time()
 
     for epoch in range(starting_epoch, epochs):
         if epoch == starting_epoch and starting_batch > 0:
@@ -261,10 +278,14 @@ def train_loop(
                         torch.xpu.empty_cache()
 
                 if accelerator.is_main_process and global_mb_step % 10 == 0:
+                    elapsed = time.time() - start_time
+                    it_per_sec = 10 / elapsed if elapsed > 0 else 0
                     logging.info(
                         f"Epoch {epoch+1}/{epochs} | Chunk {actual_chunk_idx+1} | MB {global_mb_step} | "
-                        f"Loss: {avg_loss:.4f} | CE: {avg_ce:.4f} | JEPA: {avg_jepa:.4f} | Route: {avg_route:.4f}"
+                        f"Loss: {avg_loss:.4f} | CE: {avg_ce:.4f} | JEPA: {avg_jepa:.4f} | Route: {avg_route:.4f} | "
+                        f"Speed: {it_per_sec:.2f} it/s"
                     )
+                    start_time = time.time()
                     with open(csv_filename, mode='a', newline='') as f:
                         writer = csv.writer(f)
                         writer.writerow([epoch+1, actual_chunk_idx+1, global_mb_step, avg_ce, avg_jepa, avg_route, avg_loss])
@@ -291,5 +312,6 @@ def train_loop(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--curriculum_phase", type=str, default="frontier_traces")
+    parser.add_argument("--epochs", type=int, default=2)
     args = parser.parse_args()
-    train_loop(curriculum_phase=args.curriculum_phase)
+    train_loop(epochs=args.epochs, curriculum_phase=args.curriculum_phase)
