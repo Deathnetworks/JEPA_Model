@@ -80,28 +80,34 @@ if ($LASTEXITCODE -ne 0) {
 $duration = (Get-Date) - $startTime
 Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 1 Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
 
-# Stage 3
-Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] \nStarting Stage 3A: JEPA Loop Training (Frontier Traces)..." -ForegroundColor Cyan
+# =====================================================================
+# Stage 3: Curriculum Training Loops (Corrected Order)
+# =====================================================================
+
+# Phase 1: General Knowledge (The Foundation Anchor)
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] `nStarting Stage 3A: JEPA Loop Training (General Knowledge)..." -ForegroundColor Cyan
 $startTime = Get-Date
-python src/train_latent_loop.py --epochs 2 --curriculum_phase "frontier_traces"
+python src/train_latent_loop.py --epochs 2 --curriculum_phase "general_knowledge"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Stage 3A failed with exit code $LASTEXITCODE. Halting pipeline to prevent cascading errors." -ForegroundColor Red
     [System.Environment]::Exit($LASTEXITCODE)
 }
 $duration = (Get-Date) - $startTime
-Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 3A Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 3A (General Knowledge) Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
 
-Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] \nStarting Stage 3B: JEPA Loop Training (General Knowledge)..." -ForegroundColor Cyan
+# Phase 2: Frontier Traces (Reasoning & Agent Traces Expansion)
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] `nStarting Stage 3B: JEPA Loop Training (Frontier Traces)..." -ForegroundColor Cyan
 $startTime = Get-Date
-python src/train_latent_loop.py --epochs 2 --curriculum_phase "general_knowledge"
+python src/train_latent_loop.py --epochs 2 --curriculum_phase "frontier_traces"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Stage 3B failed with exit code $LASTEXITCODE. Halting pipeline to prevent cascading errors." -ForegroundColor Red
     [System.Environment]::Exit($LASTEXITCODE)
 }
 $duration = (Get-Date) - $startTime
-Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 3B Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 3B (Frontier Traces) Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
 
-Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] \nStarting Stage 3C: JEPA Loop Training (Code Mechanics)..." -ForegroundColor Cyan
+# Phase 3: Code Mechanics (Surgical Refinement)
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] `nStarting Stage 3C: JEPA Loop Training (Code Mechanics)..." -ForegroundColor Cyan
 $startTime = Get-Date
 python src/train_latent_loop.py --epochs 2 --curriculum_phase "code_mechanics"
 if ($LASTEXITCODE -ne 0) {
@@ -109,7 +115,7 @@ if ($LASTEXITCODE -ne 0) {
     [System.Environment]::Exit($LASTEXITCODE)
 }
 $duration = (Get-Date) - $startTime
-Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 3C Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
+Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] Stage 3C (Code Mechanics) Completed in $($duration.Hours)h $($duration.Minutes)m $($duration.Seconds)s" -ForegroundColor Green
 
 # # Stage 4
 # Write-Host "[$((Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))] `nStarting Stage 4: Decoder Training..." -ForegroundColor Cyan
