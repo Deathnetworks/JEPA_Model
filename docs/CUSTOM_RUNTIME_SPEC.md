@@ -1,46 +1,64 @@
 # Architectural Specification: Latent Runtime Engine (LRE)
 
 ## I. Core Philosophy
-The Latent Runtime Engine (LRE) is a C++17 bare-metal inference runtime designed explicitly for Non-Autoregressive, Graph-Routed Mamba-2 models. 
 
-Unlike `llama.cpp` (which is bottlenecked by sequential Key-Value cache updating for standard Transformers), LRE focuses on **State Matrix Augmentation** and **Dynamic Layer Jumps**.
+The Latent Runtime Engine (LRE) is a C++17 bare-metal inference runtime designed explicitly for the **8B Mamba2-JEPA Hybrid Engine**.
+
+Unlike `llama.cpp`, which is bottlenecked by the quadratic memory scaling of Key-Value caches in standard Transformers, LRE optimizes for linear-time **State Matrix Augmentation**, **Dynamic Layer Routing Blocks**, and direct processing of continuous geometric latent spaces natively integrated with next-token text generation.
+
+---
 
 ## II. System Architecture Overview
 
-### 1. The Frontend (C++ / Python Bindings)
-* Handles Tokenization (SentencePiece/BPE implementation).
-* Exposes an asynchronous API to pass text/tokens to the runtime.
-* Returns raw text strings back to the user.
+### 1. The Frontend (C++ / Tokenizer Binding)
+
+* Handles fast BPE tokenization utilizing a high-efficiency native port of the `Qwen2.5` 151,643 vocabulary configuration.
+* Exposes an asynchronous streaming API to accept incoming raw sequence contexts and return auto-regressively generated tokens with minimal latency.
 
 ### 2. The Execution Graph (The ALGR Director)
-This is the "Brain" of the C++ engine. 
-* It does NOT execute layers 1 to N sequentially.
-* It maintains a `RuntimeState` struct (containing the 6144-d continuous vector).
-* It executes Block $N$, evaluates the Softmax Logit from the micro-router, and uses a C++ `switch` statement to dispatch the tensor to the memory address of Block $N+1$, Block $N-k$, or the exit node.
+
+This controls the recurrent execution flow through the 32 physical blocks:
+
+* Rather than running a traditional sequential layer pipeline, it evaluates the dynamic routing probabilities at each block boundary.
+* Maintains a core `RuntimeState` tensor mapping the 6144-dimensional hidden sequence space.
+* Dispatches execution via an explicit jump matrix implemented via a low-level C++ execution table, routing states to block $N+1$, looping back to block $N-k$, or cleanly executing an exit condition to the output projection layer once context evaluation scales out.
 
 ### 3. Hardware Abstraction Layer (HAL) & Compute Backends
-The runtime must swap compute kernels dynamically at compile time or runtime. 
+
+The runtime isolates platform-specific math operations into modular execution kernels, optimized for local workstation hardware profiles:
 
 #### Backend Implementations:
-1.  **SYCL / DPC++ (Primary):** * Native support for Intel Arc (XPU) and discrete accelerators. Uses Intel OneAPI Math Kernel Library (oneMKL) for extreme matrix multiplication speed.
-2.  **CUDA (NVIDIA):** * `cuBLAS` implementation for the heavy Mamba 1D convolutions and SSD state scans.
-3.  **HIP / ROCm (AMD):** * Source-to-source translation from CUDA. 
-4.  **Metal (Apple Silicon):** * Utilizing Metal Performance Shaders (MPS) to execute the SSD parallel scan algorithm on Unified Memory.
-5.  **Vulkan Compute (Universal/Fallback):** * Uses Vulkan compute shaders for generic execution on ARM NPUs (Snapdragon, edge devices) or unsupported discrete GPUs.
 
-## III. Memory Management (Zero-Copy Paradigm)
-* **Weight Mmap:** The 8B parameters are memory-mapped (`mmap`) directly from disk. Only the layers currently executing in the ALGR loop are paged into VRAM/Unified Memory.
-* **No KV Cache:** Because Mamba-2 is a State Space Model, we do not append tokens to a growing cache. We update a fixed-size `[96, 128, 128]` state matrix. Memory usage remains constant regardless of whether the prompt is 10 words or 100,000 words.
+1. **SYCL / DPC++ (Primary Target):** Native hardware execution path optimized for the Intel Arc Pro GPU architectures (using the upstream OneAPI software stack). Utilizes highly tuned matrix multiplication and parallel prefix sum kernels to run Mamba2 scan operations directly within unified memory.
+2. **Vulkan Compute (Fallback):** Provides cross-platform compliance using portable SPIR-V compute shaders for alternative discrete hardware or edge compute layers.
 
-## IV. The Dual-Stage Decoder Pipeline in C++
-Once the ALGR loop finishes, the `RuntimeState` vector is passed to the Decoder struct.
-1.  **Draft Kernel:** A massive, highly parallel matrix multiplication that projects `[1024]` -> `[256 * 6144]` in a single GPU dispatch.
-2.  **Sweep Kernel:** A custom causal attention kernel that performs exactly two passes over the 256 tokens.
-3.  **Argmax Extraction:** CPU pulls the final IDs and decodes them to string.
+---
 
-## V. Future Roadmap
-* **Phase 1:** Build CPU-only math primitives (reference implementation).
-* **Phase 2:** Implement SYCL Backend for Intel Arc validation.
-* **Phase 3:** Write the ALGR Director logic for dynamic layer jumping.
-* **Phase 4:** Add CUDA/Metal backends via CMake toggles.
-* **Phase 5:** Implement INT4 / INT8 weight quantization loaders.
+## III. Memory Management & Context Scaling
+
+### 1. Zero-Copy State Persistence
+
+The model weights are mapped directly into system/accelerator space using high-speed virtual memory file mapping (`mmap`). Only the execution tensors and static projection maps are persistently held active in execution VRAM.
+
+### 2. Fixed recurrent State Windows
+
+Because the model replaces attention mechanics with Mamba2 state-space equations, token sequence length does not introduce quadratic state scaling. The execution loop retains a stable hidden matrix structure:
+
+$$\text{State Matrix Dimension} = [96 \text{ Heads}, 128 \text{ States}, 128 \text{ States}]$$
+
+Memory allocation remains constant at runtime, enabling long-context execution without cache memory eviction or degradation.
+
+### 3. Chunked Inference Boundary Alignment
+
+Matching the training architecture's Truncated BPTT execution rules, incoming contexts exceeding processing windows are segmented into explicit `4096`-token inference blocks. The hidden state matrix $h_t$ is preserved across boundaries and sequentially injected to preserve context without computational state bloat.
+
+---
+
+## IV. The Unified Generation & Alignment Pipeline
+
+When processing an inference step, the execution loop unifies token projection with continuous semantic alignment:
+
+1. **The Recurrent Loop:** The ALGR Director routes the 6144-dimensional text representation through the recurrent Mamba2 layers.
+2. **JEPA Latent Projection:** Concurrently, the average-pooled state of the routing trajectory is passed through the JEPA projector, mapping it to a 1024-dimensional continuous space. This vector serves as a direct semantic tracking handle for agentic tasks and state verification.
+3. **Autoregressive Token Sweep:** The final output hidden state of the backbone is mapped through the vocabulary projection layer ($6144 \rightarrow 151643$) to extract raw token logits for causal generation.
+4. **Argmax / Sampling Execution:** Low-overhead top-$p$ / temperature sampling kernels run directly on the accelerator backend, streaming the resulting token indices immediately back to the host process thread.

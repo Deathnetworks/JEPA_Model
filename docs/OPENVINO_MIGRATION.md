@@ -1,31 +1,74 @@
-# Migration Path: PyTorch to Intel OpenVINO
+# Migration Path: PyTorch to Intel OpenVINO (Native XPU)
 
 ## The Challenge
-Standard Autoregressive (AR) models are easily converted to OpenVINO. However, our **Arbitrary Layer Graph Routing (ALGR)** uses dynamic `while` loops that break standard JIT tracing. OpenVINO handles static graphs best.
 
-## Step 1: Model Preparation (Eliminating Data-Dependent Python Loops)
-Before exporting, the PyTorch model's `forward` pass must be refactored to use `torch.cond` or `torch.where` instead of Python `while` loops, or traced using PyTorch 2.0's `torch.export` (PT2 Export) which captures dynamic control flows better than the legacy `torch.jit.trace`.
+Migrating the **Mamba2-Latent-Loop-8B** to OpenVINO presents two distinct challenges compared to standard Transformer models:
 
-## Step 2: ONNX / PT2 Export
-1. **Export the Mamba Engine:**
-   ```python
-   import torch
-   # Export using TorchScript (Scripting, not tracing, due to the while loop)
-   scripted_engine = torch.jit.script(engine)
-   torch.onnx.export(scripted_engine, input_tokens, "mamba_engine.onnx", opset_version=17)
+1. **Dynamic Control Flow:** The Arbitrary Layer Graph Routing (ALGR) utilizes dynamic jumps and conditional loops, whereas OpenVINO traditionally optimizes static execution graphs.
+2. **Stateful Matrix Persistence:** Unlike Transformers that append to a Key-Value cache, Mamba2 maintains a fixed recurrent matrix ($h_t$). This state must persist across inference calls without constantly copying data back and forth to the host CPU.
+
+## Step 1: Model Preparation (Stateful Refactoring)
+
+Before exporting, the PyTorch model's `forward` pass must explicitly expose the Mamba2 recurrent state as an input and output.
+
+Refactor the execution wrapper to accept the previous state and return the updated state. Avoid purely data-dependent Python `while` loops; instead, rely on PyTorch 2.x `torch.cond` or `torch.export` which natively capture dynamic control flow.
+
+```python
+# Refactored for Stateful Tracing
+def forward(self, input_tokens, h_prev):
+    # h_prev shape: [Batch, 96, 128, 128]
+    logits, h_next = self.mamba2_algr_core(input_tokens, h_prev)
+    return logits, h_next
 
 ```
 
-2. **Export the Decoder:**
-The decoder is a standard transformer and can be easily traced to ONNX.
+## Step 2: Direct OpenVINO Conversion (Bypassing ONNX)
 
-## Step 3: OpenVINO Model Optimizer (MO)
+OpenVINO 2024.x+ natively ingests PyTorch models, completely eliminating the need for the ONNX intermediate step. You can trace the model directly using `ov.convert_model`.
 
-Use the OpenVINO toolkit to convert the `.onnx` files into the OpenVINO Intermediate Representation (IR) `.xml` and `.bin` files.
+```python
+import torch
+import openvino as ov
 
-```bash
-ovc mamba_engine.onnx --compress_to_fp16 --output_dir openvino_models/
-ovc decoder.onnx --compress_to_fp16 --output_dir openvino_models/
+# 1. Instantiate dummy inputs for the trace
+dummy_tokens = torch.zeros((1, 4096), dtype=torch.long)
+dummy_state = torch.zeros((1, 96, 128, 128), dtype=torch.bfloat16)
+
+# 2. Convert PyTorch model natively
+ov_model = ov.convert_model(
+    model, 
+    example_input=(dummy_tokens, dummy_state)
+)
+
+```
+
+### Applying Stateful Transformations
+
+To prevent the host application from manually passing the `[96, 128, 128]` tensor back and forth during every step, OpenVINO allows you to fuse the state internally using the `MakeStateful` transformation:
+
+```python
+from openvino.runtime.passes import MakeStateful
+
+# Maps the output state tensor directly back to the input state tensor internally
+MakeStateful({"h_prev": "h_next"}).run_on_model(ov_model)
+
+```
+
+## Step 3: Weight Compression (NNCF)
+
+An 8B model stored in 16-bit precision requires ~16GB of VRAM. To maximize the execution speed and memory bandwidth on the Intel Arc Pro B70, compress the weights to INT8 or INT4 using the Neural Network Compression Framework (NNCF).
+
+```python
+import nncf
+
+# Compress weights to INT8 to halve the memory footprint to ~8GB
+compressed_ov_model = nncf.compress_weights(
+    ov_model, 
+    mode=nncf.CompressWeightsMode.INT8_ASYM
+)
+
+# Save the optimized Intermediate Representation (IR) files (.xml / .bin)
+ov.save_model(compressed_ov_model, "openvino_models/mamba2_8b_int8.xml")
 
 ```
 
@@ -33,6 +76,27 @@ ovc decoder.onnx --compress_to_fp16 --output_dir openvino_models/
 
 Write a lightweight OpenVINO inference script using the `openvino.runtime` API.
 
-* Load the IR models.
-* Target the `GPU` device (which maps directly to your Arc B70).
-* OpenVINO's runtime will automatically compile the execution graph into optimized SYCL/Level-Zero machine code for the Intel GPU.
+Because we applied the `MakeStateful` transformation, the OpenVINO runtime manages the Mamba2 state automatically.
+
+```python
+import openvino as ov
+
+core = ov.Core()
+
+# Target the Arc B70 natively via SYCL execution
+compiled_model = core.compile_model("openvino_models/mamba2_8b_int8.xml", device_name="GPU")
+
+# The state is automatically held in GPU memory. 
+# You only need to pass the incoming text tokens.
+infer_request = compiled_model.create_infer_request()
+
+# Execute Chunk 1
+outputs_1 = infer_request.infer({0: tokens_chunk_1})
+
+# Execute Chunk 2 (State from Chunk 1 is automatically applied)
+outputs_2 = infer_request.infer({0: tokens_chunk_2})
+
+# Reset the state when processing a completely new user prompt
+infer_request.reset_state()
+
+```

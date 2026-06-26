@@ -2,55 +2,63 @@
 
 ```
 ┌──────────────────────────────────┐      ┌──────────────────────────────────┐
-│   Phase 1: Environment & Arch    │ ───► │  Phase 2: Teacher Distillation   │
-│   - Install Native XPU Backend   │      │  - Extract Target Vector Maps    │
-│   - Instantiate 8B Mamba Modules │      │  - Cache PyTorch Binaries (.pt)  │
+│   Phase 1: Environment & Arch    │ ───► │  Phase 2: Frontier Ingestion     │
+│   - Setup Native PyTorch XPU     │      │  - Asynchronous Stream Pipeline  │
+│   - Initialize 8B Mamba2 Core    │      │  - Cache Vector Maps (.pt)       │
 └──────────────────────────────────┘      └──────────────────────────────────┘
                                                             │
                                                             ▼
 ┌──────────────────────────────────┐      ┌──────────────────────────────────┐
-│   Phase 4: Decoder & Harness     │ ◄─── │     Phase 3: The JEPA Loop       │
-│   - Train Speculative Overwrite  │      │  - Simulated 4-bit QAT Training  │
-│   - Live Rust/Cargo Verifications│      │  - Apply Alignment/Route Losses  │
+│   Phase 4: LRE Native Runtime    │ ◄─── │    Phase 3: Hybrid Training      │
+│   - Port Tokenizer & Execution   │      │  - Chunked State-Passing TBPTT   │
+│   - Native SYCL/XPU Inference    │      │  - Tri-Partite Loss Dynamics     │
 └──────────────────────────────────┘      └──────────────────────────────────┘
 
 ```
 
 ## Phase 1: Environment & Architecture Initialization
-1. **Repository Setup:** Verify Intel XPU access.
-2. **Accelerate Initialization:** Configure Hugging Face `accelerate` for CPU offloading of optimizer states to accommodate the 8B parameters.
-3. **Hardware Targeting:** Enforce native Intel graphics acceleration. Jules must ensure all data-loading tensors explicitly target `device = torch.device("xpu")`. No CUDA dependencies or wrappers are permitted.
-4. **Sanity Check Execution:** Before launching heavy loops, run the hardware verification script to confirm access to the full 33.46 GB allocation on the Intel Arc Pro B70.
 
-## Phase 2: Teacher Distillation & Target Generation
+1. **Native XPU Workspace Alignment:** Establish a clean Python 3.10+ virtual environment. Force-install modern upstream PyTorch wheels compiled explicitly for Intel hardware configurations:
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
 
-1. **Ingest Source Datasets:** Execute `dataset_preparation.py` to stream code-reasoning repositories (`AlicanKiraz0/Agentic-Chain-of-Thought-Coding-SFT-Dataset` and `TheAgenticAI/Agentic-Reasoning`).
-2. **Dataset Tagging:** Instead of dumping all data into one matrix, `dataset_preparation.py` segments data into `logic_set.pt` and `agentic_set.pt`.
-3. **Concept Extraction:** Extract teacher responses and encode them into mathematical targets, caching them to disk.
-4. **Establish Latent Targets:** Map Qwen's text representations through a dense projection layer down to a frozen `1024` dimensions to serve as our target concept vectors ($Y_{target}$). Cache the resulting tensors directly to disk inside `F:\JEPA_Model\data\` as binary `.pt` files to eliminate redundant processing during training.
-
-## Phase 3: Engine Training (The JEPA Loop)
-
-1. **Resumption Protocol:** On startup, the script searches for `checkpoint_latest/`. If found, it loads weights, optimizer states, and the specific curriculum phase/epoch.
-2. **Instantiate 4-bit QAT Configuration:** Initialize the 8B Mamba-2 weights using simulated 4-bit quantization weights. The micro-routers, layer normalization matrices, and tracking heads must remain pinned at native FP16/BF16 precision to avoid gradient degradation.
-3. **Forward Graph Routing Execution:** Pass the processed source text arrays into the model. Track layer traversal via a tracking matrix, incrementing values at every routing jump.
- - **Sub-Phase 3A (Logic Training):** Train the 8B Mamba Engine exclusively on `logic_set.pt`. 
- - **Sub-Phase 3B (Agentic Training):** Shift training to `agentic_set.pt`, heavily penalizing excessive routing loops via the efficiency loss parameter to force fast tool-use decisions.
-4. **Calculate Compound Objective Metrics:** Optimize the parameters by combining three distinct error tracking steps:
-* **Latent Alignment Loss:** $\text{MSE}(H_{final}, Y_{target}) + (1.0 - \text{CosineSimilarity}(H_{final}, Y_{target}))$
-* **Efficiency Regularization:** Introduce a penalty factor scaled by $\gamma = 0.001$ against total global sequence hops to incentivize swift execution paths.
-* **Backpropagation:** Run standard parameter optimization updates based on the cumulative loss values.
+```
 
 
-
-## Phase 4: Decoder Symbiosis & Harness Integration
-
-1. **Freeze Core Blocks:** Freeze all internal weights inside the 32 Mamba-2 layers and their corresponding micro-routers.
-2. **Train Speculative Decoding:** Train the Stage 1 and Stage 2 decoders to map the perfect latent concepts to precise programming syntax constraints (Rust, C++, etc.).
-3. **Execution Harness Connection:** Pipe the text canvas directly into a local file manipulation handler. Write out the generated Rust files and pass them directly to an automated shell command running `cargo check`.
-4. **Runtime Error Looping:** If the compilation process returns syntax errors, read the error stream directly back into the model's primary input stream. This prompts the graph router to loop through additional physical blocks to identify structural fixes without forcing the user to manually engineer a prompt correction.
-
-## Phase 5: Autonomous Inference Harness
-1. **Execution Loop:** Run the pipeline. Extract output, compile via subprocess, and route errors back to the model's latent state.
+2. **Memory Footprint Baselining:** Initialize the 32 physical blocks of the 6144-hidden-dimension Mamba2 architecture. Bind `bitsandbytes.optim.AdamW8bit` as the core optimization driver to keep the base weights and gradient states compressed under 16GB, leaving the remainder of the 32GB allocation wide open for token activation processing.
+3. **Hardware Targeting Verification:** Enforce strict device casting hooks (`device = torch.device("xpu")`) across all tensor instantiation routines. Do not declare any legacy CUDA or third-party compatibility layers.
+4. **Kernel Fusion Verification:** Execute an immediate tracking test using `torch.compile(model, backend="inductor")` to ensure the upstream SYCL compiler can cleanly optimize and merge the custom layer graph routing hooks into high-throughput device execution streams.
 
 ---
+
+## Phase 2: High-Speed Frontier Ingestion (`extract_frontier_data.py`)
+
+1. **Multi-Domain Ingestion Setup:** Construct the data streaming framework to load the three definitive target blocks (Curated Frontier Traces, Massive General Knowledge Backbone, and Code Syntax/Mechanics) directly from Hugging Face.
+2. **Streaming Ram Countermeasures:** Enforce `streaming=True` on all `load_dataset` declarations to stream records dynamically into host memory, discarding them immediately post-vectorization to keep disk space and active RAM usage baseline-flat.
+3. **Polymorphic Target Parsing:** Execute a structural normalization mapping function to transparently unpack incoming dataset footprints (`messages`, `conversations`, `instruction/output`) down to uniform `(prompt, response)` strings.
+4. **XPU Acceleration Embedding Vectorization:** Process the prompt strings using the `Qwen/Qwen2.5-7B-Instruct` vocabulary on the host CPU. Concurrently, route the targeted responses through `BAAI/bge-large-en-v1.5` executing natively on the XPU to cache 1024-dimensional $L_2$-normalized continuous concept handles.
+5. **Resilient Local Sharding:** Package the processed unpadded token sequences and target concepts into uniform sequence blocks, dumping out compressed `.pt` shards to the local storage environment every 1,000 clean entries.
+
+---
+
+## Phase 3: The Hybrid Training Loop (`train_jepa_world_model.py`)
+
+1. **Chunked State-Passing (TBPTT Execution):** Establish an unpadded streaming dataloader that segments incoming long-context sequences into deterministic `4096`-token processing chunks.
+2. **State Decoupling Routine:** Pass the internal recurrent Mamba2 states across sequential block processing operations. Prior to compiling gradients for Chunk $N+1$, invoke `h = h.detach()` to cap autograd memory overhead at a flat $O(1)$ window relative to total sequence length.
+3. **Tri-Partite Loss Evaluation:** Calculate the exact combined update pressure at every gradient step:
+* **$\mathcal{L}_{CE}$:** Cross-Entropy prediction errors mapped over the `qwen_tokens`.
+* **$\mathcal{L}_{JEPA}$:** `F.cosine_embedding_loss` tracking the distance between the projection head and the continuous `target_concept`.
+* **$\mathcal{L}_{Route}$:** A Router Z-loss penalty enforcing uniform load balancing across the ALGR block up to a strict maximum loop ceiling ($\text{max\_loops} = 4$).
+
+
+4. **Dynamic Loss Weight Modulation:** Implement an exponential scaling schedule for the alignment factor $\lambda_{JEPA}(t)$, starting at `0.01` and scaling linearly to `1.0` during the first 10% of global optimization steps to protect the core networks from structural latent space collapse.
+5. **Gradient Accumulation Loop:** Map a single sequence chunk to device memory at any isolated point, accumulating gradient updates across 16 steps before executing the optimizer step.
+
+---
+
+## Phase 4: Native Inference Integration (Latent Runtime Engine)
+
+1. **C++17 Engine Scaffolding:** Instantiate the pure execution architecture for the Latent Runtime Engine (LRE) to bypass bloated, high-overhead runtime dependencies.
+2. **Zero-Copy Memory-Mapped Arrays:** Bind the 8B model configuration layers directly into execution space via virtual file allocation maps (`mmap`), allowing active pages to pull directly from fast storage vectors.
+3. **SYCL Unified Memory Implementation:** Map the fixed-size `[96, 128, 128]` Mamba2 internal recurrent matrix structures directly into accelerator memory space using native Intel OneAPI primitives, eliminating the overhead of Key-Value data allocation entirely.
+4. **ALGR Jump Execution Routing:** Build a clean, low-overhead C++ execution table to manage block traversal based on active router outputs, allowing the runtime to cleanly exit to output projection arrays or scale operations dynamically on the fly.
