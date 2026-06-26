@@ -3,7 +3,7 @@ import os
 import torch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.model_architecture import Mamba2LatentLoop8B
+from src.model_architecture import MambaJEPAEngine, DualStageLatentDecoder
 
 def test_engine_tensor_shapes():
     """
@@ -16,8 +16,11 @@ def test_engine_tensor_shapes():
     # Initialize a miniature version of the 8B engine for local memory safety
     d_model = 64
     num_blocks = 2
-    model = Mamba2LatentLoop8B(d_model=d_model, num_blocks=num_blocks, max_budget=4).to(device)
+    model = MambaJEPAEngine(vocab_size=151643, d_model=d_model, num_blocks=num_blocks, max_budget=4, d_latent=1024).to(device)
+    decoder = DualStageLatentDecoder(d_latent=1024, max_seq_len=512, d_model=d_model, vocab_size=151643).to(device)
+
     model.eval()
+    decoder.eval()
 
     batch_size = 2
     seq_len = 512
@@ -28,7 +31,8 @@ def test_engine_tensor_shapes():
 
     with torch.no_grad():
         # Execute the ALGR routed forward pass
-        logits, jepa_concept, final_state = model(mock_tokens, mamba_state=mamba_state)
+        jepa_concept, global_steps, final_state = model(mock_tokens, mamba_state=mamba_state)
+        logits = decoder(jepa_concept)
 
     print("\n--- Tensor Dimensionality Report ---")
     

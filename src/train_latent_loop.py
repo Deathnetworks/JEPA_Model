@@ -1,6 +1,7 @@
 import os
 import csv
 import time
+import math
 import logging
 import argparse
 from accelerate import Accelerator
@@ -10,15 +11,60 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import bitsandbytes as bnb
 
 try:
     import intel_extension_for_pytorch as ipex
 except ImportError:
     pass
 
-from .model_architecture import Mamba2LatentLoop8B, MambaJEPAEngine
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from src.model_architecture import Mamba2LatentLoop8B, MambaJEPAEngine, DualStageLatentDecoder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class TripartiteLoss(nn.Module):
+    def __init__(self, max_loops=4):
+        super().__init__()
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=0)
+        self.max_loops = max_loops
+        self.lambda_route = 0.01
+
+    def forward(self, logits, qwen_tokens, student_concept, target_concept, global_steps, lambda_jepa):
+        batch_size, seq_len, vocab_size = logits.shape
+        logits_flat = logits.view(batch_size * seq_len, vocab_size)
+        qwen_tokens_flat = qwen_tokens.reshape(-1)
+
+        l_ce = self.ce_loss(logits_flat, qwen_tokens_flat)
+
+        l_jepa = 1 - F.cosine_similarity(student_concept, target_concept, dim=-1).mean()
+
+        avg_loops = global_steps.float().mean() if global_steps.dtype != torch.float32 else global_steps.mean()
+        if avg_loops > self.max_loops:
+            l_route = (avg_loops - self.max_loops) ** 2
+        else:
+            l_route = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+
+        total_loss = l_ce + (lambda_jepa * l_jepa) + (self.lambda_route * l_route)
+        return total_loss, l_ce, l_jepa, l_route
+
+def get_lambda_jepa(step, warmup_steps=1000):
+    if step >= warmup_steps:
+        return 1.0
+    start_val = 0.01
+    end_val = 1.0
+    progress = step / warmup_steps
+    return start_val + progress * (end_val - start_val)
+
+def get_lr_scheduler(optimizer, warmup_steps, total_steps):
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
 
 class JEPADataset(Dataset):
     def __init__(self, data_dir=r"F:\JEPA_Model\data\shards", curriculum_phase="frontier_traces"):
@@ -34,11 +80,6 @@ class JEPADataset(Dataset):
     def __getitem__(self, idx):
         file_path = self.file_paths[idx]
         try:
-            # We load the chunk, which is a list of dicts.
-            # However, since this returns the whole chunk (up to 1000 items),
-            # we want the DataLoader to iterate over individual items.
-            # Standard PyTorch Dataset isn't perfectly mapped for this if we return the whole list.
-            # But we can use `collate_fn` to flatten the list of lists.
             data_chunk = torch.load(file_path, map_location="cpu", weights_only=False)
             return data_chunk
         except Exception as e:
@@ -46,67 +87,76 @@ class JEPADataset(Dataset):
             return []
 
 def collate_jepa_chunk(batch):
-    # `batch` is a list of `data_chunk` lists from the Dataset.
-    # Usually batch_size=1 from DataLoader if we want to yield chunks.
-    # We will flatten the chunks and take a random subset or process sequentially.
-    # To keep memory bounded, we just return the flattened items up to a batch size,
-    # but the simplest way is to yield the flattened list and let the training loop handle batching
-    # OR create a custom IterableDataset.
-
-    # Let's flatten everything in the current Dataset batch
     flattened = [item for sublist in batch for item in sublist]
     if not flattened:
-        return None, None
-
-    # We will just pad the flattened list together into one giant batch,
-    # or the user specifies batch_size=1 to load 1 chunk (1000 items) and then
-    # in the train loop we process the chunk in mini-batches.
-
+        return None
     return flattened
 
 def get_dataloader(data_dir=r"F:\JEPA_Model\data\shards", batch_size=1, num_workers=0, curriculum_phase="frontier_traces"):
-    # batch_size=1 means we load 1 chunk (e.g. 1000 items) per iteration
     dataset = JEPADataset(data_dir, curriculum_phase=curriculum_phase)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_jepa_chunk)
 
 
 def train_loop(
     epochs=10,
-    mini_batch_size=4,
-    accumulation_steps=4,
-    gamma=0.001,
-    learning_rate=1e-4,
+    mini_batch_size=1,
+    learning_rate=3e-4,
     data_dir=r"F:\JEPA_Model\data\shards",
     curriculum_phase="frontier_traces"
 ):
-    accelerator = Accelerator()
+    accelerator = Accelerator(gradient_accumulation_steps=16)
     device = accelerator.device
-    logging.info(f"Targeting compute via accelerate device: {device}")
 
-    # Initialize Engine
-    model = MambaJEPAEngine()
+    if device.type == 'cpu':
+        logging.warning("Running on CPU, using heavily downgraded hyperparameters to avoid OOM.")
+        model = MambaJEPAEngine(d_model=64, num_blocks=2, max_budget=2, d_latent=1024)
+        decoder = DualStageLatentDecoder(d_model=64, d_latent=1024)
+    else:
+        model = MambaJEPAEngine()
+        decoder = DualStageLatentDecoder()
+
+    if device.type == "xpu":
+        torch._inductor.config.freezing = True
+        torch._inductor.config.max_autotune = True
+        torch._inductor.config.coordinate_descent_tuning = True
+        model = torch.compile(model, backend="inductor")
+        decoder = torch.compile(decoder, backend="inductor")
+
+    model = model.to(device)
+    decoder = decoder.to(device)
+
     model.train()
+    decoder.train()
 
-    # Optimized optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    optimizer_grouped_parameters = [
+        {"params": [p for n, p in model.named_parameters() if p.requires_grad]},
+        {"params": [p for n, p in decoder.named_parameters() if p.requires_grad]}
+    ]
 
-    # Loss functions
-    mse_criterion = nn.MSELoss()
+    optimizer = bnb.optim.AdamW8bit(
+        optimizer_grouped_parameters,
+        lr=learning_rate,
+        betas=(0.9, 0.95),
+        weight_decay=0.1
+    )
 
-    # DataLoader (loads full chunks)
-    # We use shuffle=False because we process chunk by chunk
+    criterion = TripartiteLoss(max_loops=4)
+
     dataloader = get_dataloader(data_dir=data_dir, batch_size=1, curriculum_phase=curriculum_phase)
 
-    # Accelerate prepare
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    total_steps = len(dataloader) * epochs
+    warmup_steps = int(0.05 * total_steps)
+    lr_scheduler = get_lr_scheduler(optimizer, warmup_steps=warmup_steps, total_steps=total_steps)
+
+    model, decoder, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        model, decoder, optimizer, dataloader, lr_scheduler
+    )
 
     checkpoint_dir = "checkpoint_latest"
     starting_epoch = 0
     starting_batch = 0
 
-    # Custom metadata file for epoch/batch tracking
     metadata_path = os.path.join(checkpoint_dir, "training_state.txt")
-
     if os.path.exists(checkpoint_dir):
         logging.info(f"Resuming from checkpoint {checkpoint_dir}")
         accelerator.load_state(checkpoint_dir)
@@ -117,20 +167,29 @@ def train_loop(
                 starting_batch = int(parts[1])
             logging.info(f"Resuming at Epoch {starting_epoch}, Batch {starting_batch}")
 
-
-    # Setup logging CSV
     csv_filename = "training_trace.csv"
     file_exists = os.path.isfile(csv_filename)
-    with open(csv_filename, mode='a', newline='') as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["Epoch", "ChunkIdx", "MiniBatch", "Latent_Loss", "Efficiency_Loss", "Total_Loss", "Avg_Routing_Steps"])
+    if accelerator.is_main_process:
+        with open(csv_filename, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["Epoch", "ChunkIdx", "MB", "CE_Loss", "JEPA_Loss", "Route_Loss", "Total_Loss"])
+
+    chunk_size = 4096
+    accumulation_steps = 16
+
+    if not hasattr(optimizer, 'step_count'):
+        optimizer.step_count = 0
+
+    original_step = optimizer.step
+    def step_with_count(*args, **kwargs):
+        original_step(*args, **kwargs)
+        optimizer.step_count += 1
+    optimizer.step = step_with_count
 
     optimizer.zero_grad()
 
     for epoch in range(starting_epoch, epochs):
-
-        # If resuming in the middle of an epoch, skip the first `starting_batch` batches
         if epoch == starting_epoch and starting_batch > 0:
             active_dataloader = accelerator.skip_first_batches(dataloader, starting_batch)
         else:
@@ -141,92 +200,81 @@ def train_loop(
                 continue
 
             actual_chunk_idx = chunk_idx + (starting_batch if epoch == starting_epoch else 0)
-
-            # Process the chunk in mini-batches
             num_items = len(flattened_chunk)
 
             for i in range(0, num_items, mini_batch_size):
                 mini_batch = flattened_chunk[i:i+mini_batch_size]
 
-                # Pad input_tokens
                 input_tokens_list = [item["input_tokens"] for item in mini_batch]
+                qwen_tokens_list = [item.get("qwen_tokens", item["input_tokens"]) for item in mini_batch]
                 target_concepts_list = [item["target_concept"] for item in mini_batch]
 
-                # Dynamic padding using pad_sequence
-                # Pad token id was 0 or eos from qwen, let's use 0
-                padded_input_tokens = torch.nn.utils.rnn.pad_sequence(input_tokens_list, batch_first=True, padding_value=0).to(device)
+                padded_input = torch.nn.utils.rnn.pad_sequence(input_tokens_list, batch_first=True, padding_value=0).to(device)
+                padded_qwen = torch.nn.utils.rnn.pad_sequence(qwen_tokens_list, batch_first=True, padding_value=0).to(device)
                 target_concepts = torch.stack(target_concepts_list).to(device)
 
+                seq_len = padded_input.size(1)
                 mamba_state = None
 
-                # Forward pass
-                student_concept, global_steps, mamba_state = model(padded_input_tokens, mamba_state=mamba_state)
+                for t in range(0, seq_len, chunk_size):
+                    c_input = padded_input[:, t:t+chunk_size]
+                    c_qwen = padded_qwen[:, t:t+chunk_size] if padded_qwen.size(1) > 1 else padded_qwen
 
-                # Latent Alignment Loss: MSE(H_final, Y_target) + (1.0 - CosineSimilarity(H_final, Y_target))
-                mse_loss = mse_criterion(student_concept, target_concepts)
-                cos_sim = F.cosine_similarity(student_concept, target_concepts, dim=-1).mean()
-                alignment_loss = mse_loss + (1.0 - cos_sim)
+                    with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
+                        student_concept, global_steps, mamba_state = model(c_input, mamba_state=mamba_state)
+                        logits = decoder(student_concept)
 
-                # Efficiency Regularization: gamma * average routing steps
-                # global_steps shape: [Batch, Seq_Len, 1]
-                avg_routing_steps = global_steps.float().mean() if global_steps.dtype != torch.float32 else global_steps.mean()
-                efficiency_loss = gamma * avg_routing_steps
+                        min_len = min(logits.size(1), c_qwen.size(1))
+                        logits_aligned = logits[:, :min_len, :]
+                        c_qwen_aligned = c_qwen[:, :min_len]
 
-                # Total loss
-                loss = alignment_loss + efficiency_loss
-                loss_scaled = loss / accumulation_steps
+                        lambda_jepa = get_lambda_jepa(optimizer.step_count, warmup_steps=1000)
 
-                # Backward pass
-                accelerator.backward(loss_scaled)
+                        loss, l_ce, l_jepa, l_route = criterion(
+                            logits_aligned, c_qwen_aligned, student_concept, target_concepts, global_steps, lambda_jepa
+                        )
 
-                if mamba_state is not None:
-                    mamba_state = [s.detach() if s is not None else None for s in mamba_state]
+                        loss_scaled = loss / accumulation_steps
 
-                # Gradient Accumulation
-                if ((i // mini_batch_size) + 1) % accumulation_steps == 0:
+                    accelerator.backward(loss_scaled)
+
+                    if mamba_state is not None:
+                        mamba_state = mamba_state.detach()
+
+                # Track steps inside mini-batch to properly step accumulation
+                current_mb_step = (i // mini_batch_size) + 1
+
+                if current_mb_step % accumulation_steps == 0:
                     optimizer.step()
+                    lr_scheduler.step()
                     optimizer.zero_grad()
 
-                    # Clear VRAM cache hook
                     if hasattr(torch.xpu, 'empty_cache'):
                         torch.xpu.empty_cache()
 
-                # Print real-time metrics
-                if (i // mini_batch_size) % 10 == 0:
-                    print(
-                        f"Epoch: {epoch+1}/{epochs} | "
-                        f"Chunk: {actual_chunk_idx+1} | MB: {(i // mini_batch_size) + 1}/{(num_items // mini_batch_size) + 1} | "
-                        f"Align Loss: {alignment_loss.item():.4f} | "
-                        f"Eff Loss: {efficiency_loss.item():.4f} | "
-                        f"Total Loss: {loss.item():.4f} | "
-                        f"Routing Steps: {avg_routing_steps.item():.2f}"
+                if accelerator.is_main_process and current_mb_step % 10 == 0:
+                    # we will just print the loss of the last chunk of the sequence for logging purposes
+                    logging.info(
+                        f"Epoch {epoch+1}/{epochs} | Chunk {actual_chunk_idx+1} | MB {current_mb_step} | "
+                        f"Loss: {loss.item():.4f} | CE: {l_ce.item():.4f} | JEPA: {l_jepa.item():.4f} | Route: {l_route.item():.4f}"
                     )
-
-                    # Log to CSV
                     with open(csv_filename, mode='a', newline='') as f:
                         writer = csv.writer(f)
-                        writer.writerow([
-                            epoch + 1,
-                            actual_chunk_idx + 1,
-                            (i // mini_batch_size) + 1,
-                            alignment_loss.item(),
-                            efficiency_loss.item(),
-                            loss.item(),
-                            avg_routing_steps.item()
-                        ])
+                        writer.writerow([epoch+1, actual_chunk_idx+1, current_mb_step, l_ce.item(), l_jepa.item(), l_route.item(), loss.item()])
 
-        # Save checkpoint at end of epoch
         accelerator.save_state(checkpoint_dir)
-        with open(metadata_path, 'w') as f:
-            f.write(f"{epoch+1},0")
-        logging.info(f"Checkpoint saved to {checkpoint_dir}")
+        if accelerator.is_main_process:
+            with open(metadata_path, 'w') as f:
+                f.write(f"{epoch+1},0")
+            logging.info(f"Checkpoint saved to {checkpoint_dir}")
 
-    # Save model checkpoint
-    torch.save(model.state_dict(), "jepa_engine.pth")
-    logging.info("Model saved to jepa_engine.pth")
+    if accelerator.is_main_process:
+        torch.save(model.state_dict(), "jepa_engine.pth")
+        torch.save(decoder.state_dict(), "latent_decoder.pth")
+        logging.info("Models saved.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--curriculum_phase", type=str, default="frontier_traces", help="Curriculum phase to filter dataset")
+    parser.add_argument("--curriculum_phase", type=str, default="frontier_traces")
     args = parser.parse_args()
     train_loop(curriculum_phase=args.curriculum_phase)
