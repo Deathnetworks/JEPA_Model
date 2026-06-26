@@ -177,17 +177,9 @@ def train_loop(
 
     chunk_size = 4096
     accumulation_steps = 16
-
-    if not hasattr(optimizer, 'step_count'):
-        optimizer.step_count = 0
-
-    original_step = optimizer.step
-    def step_with_count(*args, **kwargs):
-        original_step(*args, **kwargs)
-        optimizer.step_count += 1
-    optimizer.step = step_with_count
-
     optimizer.zero_grad()
+
+    global_mb_step = 0
 
     for epoch in range(starting_epoch, epochs):
         if epoch == starting_epoch and starting_batch > 0:
@@ -216,6 +208,12 @@ def train_loop(
                 seq_len = padded_input.size(1)
                 mamba_state = None
 
+                num_chunks = (seq_len + chunk_size - 1) // chunk_size
+                track_loss = 0.0
+                track_ce = 0.0
+                track_jepa = 0.0
+                track_route = 0.0
+
                 for t in range(0, seq_len, chunk_size):
                     c_input = padded_input[:, t:t+chunk_size]
                     c_qwen = padded_qwen[:, t:t+chunk_size] if padded_qwen.size(1) > 1 else padded_qwen
@@ -228,23 +226,33 @@ def train_loop(
                         logits_aligned = logits[:, :min_len, :]
                         c_qwen_aligned = c_qwen[:, :min_len]
 
-                        lambda_jepa = get_lambda_jepa(optimizer.step_count, warmup_steps=1000)
+                        completed_opt_steps = lr_scheduler.last_epoch
+                        lambda_jepa = get_lambda_jepa(completed_opt_steps, warmup_steps=1000)
 
                         loss, l_ce, l_jepa, l_route = criterion(
                             logits_aligned, c_qwen_aligned, student_concept, target_concepts, global_steps, lambda_jepa
                         )
 
-                        loss_scaled = loss / accumulation_steps
+                        loss_scaled = loss / (accumulation_steps * num_chunks)
 
                     accelerator.backward(loss_scaled)
+
+                    track_loss += loss.detach().item()
+                    track_ce += l_ce.detach().item()
+                    track_jepa += l_jepa.detach().item()
+                    track_route += l_route.detach().item()
 
                     if mamba_state is not None:
                         mamba_state = mamba_state.detach()
 
-                # Track steps inside mini-batch to properly step accumulation
-                current_mb_step = (i // mini_batch_size) + 1
+                global_mb_step += 1
 
-                if current_mb_step % accumulation_steps == 0:
+                avg_loss = track_loss / num_chunks
+                avg_ce = track_ce / num_chunks
+                avg_jepa = track_jepa / num_chunks
+                avg_route = track_route / num_chunks
+
+                if global_mb_step % accumulation_steps == 0:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
@@ -252,15 +260,22 @@ def train_loop(
                     if hasattr(torch.xpu, 'empty_cache'):
                         torch.xpu.empty_cache()
 
-                if accelerator.is_main_process and current_mb_step % 10 == 0:
-                    # we will just print the loss of the last chunk of the sequence for logging purposes
+                if accelerator.is_main_process and global_mb_step % 10 == 0:
                     logging.info(
-                        f"Epoch {epoch+1}/{epochs} | Chunk {actual_chunk_idx+1} | MB {current_mb_step} | "
-                        f"Loss: {loss.item():.4f} | CE: {l_ce.item():.4f} | JEPA: {l_jepa.item():.4f} | Route: {l_route.item():.4f}"
+                        f"Epoch {epoch+1}/{epochs} | Chunk {actual_chunk_idx+1} | MB {global_mb_step} | "
+                        f"Loss: {avg_loss:.4f} | CE: {avg_ce:.4f} | JEPA: {avg_jepa:.4f} | Route: {avg_route:.4f}"
                     )
                     with open(csv_filename, mode='a', newline='') as f:
                         writer = csv.writer(f)
-                        writer.writerow([epoch+1, actual_chunk_idx+1, current_mb_step, l_ce.item(), l_jepa.item(), l_route.item(), loss.item()])
+                        writer.writerow([epoch+1, actual_chunk_idx+1, global_mb_step, avg_ce, avg_jepa, avg_route, avg_loss])
+        if global_mb_step % accumulation_steps != 0:
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            if hasattr(torch.xpu, 'empty_cache'):
+                torch.xpu.empty_cache()
+
+
 
         accelerator.save_state(checkpoint_dir)
         if accelerator.is_main_process:
