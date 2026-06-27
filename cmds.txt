@@ -1,3 +1,14 @@
+@echo off
 cd /d F:\JEPA_Model
-.\venv\Scripts\activate
+
+:: 1. Activate your virtual environment
+call .\venv\Scripts\activate
+
+:: 2. Let oneAPI configure its entire structural stack cleanly
+call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+
+:: 3. Assign the backend compiler variables for torch.compile/IPEX
+set CXX=icx-cl
+
+:: 4. Handoff context to your PowerShell training sequencer
 powershell -ExecutionPolicy Bypass -File run_pipeline.ps1
