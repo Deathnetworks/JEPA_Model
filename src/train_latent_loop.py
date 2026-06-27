@@ -110,7 +110,8 @@ def train_loop(
     if device.type == 'cpu':
         logging.warning("Running on CPU, using heavily downgraded hyperparameters to avoid OOM.")
         model = MambaJEPAEngine(d_model=64, num_blocks=2, max_budget=2, d_latent=1024)
-        decoder = DualStageLatentDecoder(d_model=64, d_latent=1024)
+        # FIX: Explicitly name both keyword arguments to prevent positional mismatch
+        decoder = DualStageLatentDecoder(d_latent=1024, d_model=64)
     else:
         model = MambaJEPAEngine()
         decoder = DualStageLatentDecoder()

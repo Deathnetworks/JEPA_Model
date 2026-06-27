@@ -1,0 +1,3 @@
+cd /d F:\JEPA_Model
+.\venv\Scripts\activate
+powershell -ExecutionPolicy Bypass -File run_pipeline.ps1

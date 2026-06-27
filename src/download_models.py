@@ -53,7 +53,8 @@ DATASET_QUEUE = {
     "general_knowledge": [
         "HuggingFaceFW/fineweb-edu",
         "HuggingFaceH4/ultrafeedback_clean",
-        "technium/OpenHermes-2.5",
+        "teknium/OpenHermes-2.5",
+        "teknium/openhermes",
         "KingNish/reasoning-base-20k",
         "Salesforce/wikitext",
         "banned-historical-archives/banned-historical-archives",

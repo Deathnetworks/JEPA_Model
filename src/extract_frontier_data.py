@@ -17,7 +17,6 @@ DATASET_QUEUE = {
     # 1. Curated Frontier Model Traces (Reasoning & Agentic Flow)
     "frontier_traces": [
         "Crownelius/Complete-FABLE.5-traces-2M",
-        "armand0e/claude-fable-5-claude-code",
         "ansulev/claude_mythos_distilled_25k",
         "ox-ox/mythos-character-distillation",
         "11-47/claude_opus_4.8_max_thinking_5k_v2",
@@ -50,7 +49,8 @@ DATASET_QUEUE = {
     "general_knowledge": [
         "HuggingFaceFW/fineweb-edu",
         "HuggingFaceH4/ultrafeedback_clean",
-        "technium/OpenHermes-2.5",
+        "teknium/OpenHermes-2.5",
+        "teknium/openhermes",
         "KingNish/reasoning-base-20k",
         "Salesforce/wikitext",
         "banned-historical-archives/banned-historical-archives",
@@ -230,7 +230,7 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
     device = setup_device()
 
     tokenizer_id = "Qwen/Qwen2.5-7B-Instruct"
-    encoder_id = "BAAI/bge-large-en-v1.5"
+    encoder_id = "BAAI/bge-m3"
 
     logging.info(f"Loading tokenizer: {tokenizer_id}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
