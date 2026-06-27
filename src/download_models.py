@@ -17,10 +17,9 @@ MODELS_TO_DOWNLOAD = [
 ]
 
 DATASET_QUEUE = {
-    # 1. Curated Frontier Model Traces (Reasoning & Agentic Flow)
+    # 1. Curated Frontier Model Traces (Reasoning, Alignment & Agentic Flow)
     "frontier_traces": [
         "Crownelius/Complete-FABLE.5-traces-2M",
-        "armand0e/claude-fable-5-claude-code",
         "ansulev/claude_mythos_distilled_25k",
         "ox-ox/mythos-character-distillation",
         "11-47/claude_opus_4.8_max_thinking_5k_v2",
@@ -43,10 +42,12 @@ DATASET_QUEUE = {
         "Roman1111111/gemini-3.1-pro-hard-high-reasoning",
         "PhysEdit/pawbench-gemini-expansion-20260619",
         "mfielding92/gemini-3.1-pro-2048-reasoning-1100x",
-        "rajpurkar/squad",
-        "google/boolq",
         "benchflow/skillsbench-leaderboard",
-        "evaleval/EEE_datastore"
+        "evaleval/EEE_datastore",
+        # Parallel Translation Alignments belong here!
+        "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k",
+        "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k-Alpaca-GPT4",
+        "bh2821/LightNovel5000"
     ],
 
     # 2. Massive General Knowledge, Instruction Following, & Creative Core
@@ -65,7 +66,11 @@ DATASET_QUEUE = {
         "fse/paranmt-300",
         "Skylion007/openwebtext",
         "evaluate-metric/xnli",
-        "liwu/MNBVC"
+        "liwu/MNBVC",
+        "wdndev/webnovel-chinese",
+        # Moved basic comprehension datasets here
+        "rajpurkar/squad",
+        "google/boolq"
     ],
 
     # 3. Code Syntax & Language Grammar Rules (For the JEPA World Model)
@@ -76,16 +81,12 @@ DATASET_QUEUE = {
         "bigcode/starcoder2-instruct",
         "iamtarun/python-execution-traces",
         "bigcode/the-stack",
-        "bookcorpus/bookcorpus",
         "Salesforce/wikisql",
         "gaianet/learn-rust",
         "semeru/code-code-translation-java-csharp",
         "MehdiFe/csharp-instruction-Dataset",
         "microsoft/LCC_csharp",
-        "AlgorithmicResearchGroup/arxiv_cplusplus_research_code",
-        "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k",
-        "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k-Alpaca-GPT4",
-        "bh2821/LightNovel5000"        
+        "AlgorithmicResearchGroup/arxiv_cplusplus_research_code"
     ]
 }
 
