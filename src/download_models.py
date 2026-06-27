@@ -47,7 +47,26 @@ DATASET_QUEUE = {
         # Parallel Translation Alignments belong here!
         "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k",
         "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k-Alpaca-GPT4",
-        "bh2821/LightNovel5000"
+        "bh2821/LightNovel5000",
+        "Skyhigh-2203/MiMo-2.5-Pro-Reasoning-Traces-Hard",
+        "Glint-Research/Fable-5-traces",
+        "owenqwenllmwine/bigpi-1",
+        "sornnakub/Fable-5-traces",
+        "shijunhao/Fable-5-traces",
+        "TeichAI/DeepSeek-v4-Pro-Agent",
+        "kira/Fable-5-traces",
+        "ansulev/DeepSeek-v4-Pro-Agent",
+        "hardcoremoore/DeepSeek-v4-Pro-Agent",
+        "ronaldcmz/DeepSeek-v4-Pro-Agent",
+        "ororai/ORORAi",
+        "julien-c/synthtraces",
+        "armand0e/teich-test-v1",
+        "choucsan/mimo-claude-code-traces-1k",
+        "AletheiaResearch/GLM-5.2-Agent",
+        "AletheiaResearch/GPT-5.5-Codex",
+        "Infatoshi/kernelbench-hard-traces",
+        "Quaxicron/Fable-5-traces",
+        "cfahlgren1/Fable-5-traces"
     ],
 
     # 2. Massive General Knowledge, Instruction Following, & Creative Core
@@ -86,7 +105,10 @@ DATASET_QUEUE = {
         "semeru/code-code-translation-java-csharp",
         "MehdiFe/csharp-instruction-Dataset",
         "microsoft/LCC_csharp",
-        "AlgorithmicResearchGroup/arxiv_cplusplus_research_code"
+        "AlgorithmicResearchGroup/arxiv_cplusplus_research_code",
+        "Infatoshi/kernelbench-mega-traces",
+        "jedisct1/security-audits",
+        "randomanon000/coding-sessions"
     ]
 }
 
