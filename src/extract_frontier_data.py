@@ -17,6 +17,7 @@ DATASET_QUEUE = {
     # 1. Curated Frontier Model Traces (Reasoning, Alignment & Agentic Flow)
     "frontier_traces": [
         "Crownelius/Complete-FABLE.5-traces-2M",
+        "Qwen/AgentWorldBench",
         "ansulev/claude_mythos_distilled_25k",
         "ox-ox/mythos-character-distillation",
         "11-47/claude_opus_4.8_max_thinking_5k_v2",
@@ -63,7 +64,8 @@ DATASET_QUEUE = {
         "AletheiaResearch/GPT-5.5-Codex",
         "Infatoshi/kernelbench-hard-traces",
         "Quaxicron/Fable-5-traces",
-        "cfahlgren1/Fable-5-traces"
+        "cfahlgren1/Fable-5-traces",
+        "nvidia/Nemotron-Posttraining-v3"
     ],
 
     # 2. Massive General Knowledge, Instruction Following, & Creative Core
@@ -86,7 +88,9 @@ DATASET_QUEUE = {
         "wdndev/webnovel-chinese",
         # Moved basic comprehension datasets here
         "rajpurkar/squad",
-        "google/boolq"
+        "google/boolq",
+        "nvidia/Nemotron-Pretraining-Legal-v1",
+        "nvidia/Nemotron-Pretraining-Specialized-v1.2"
     ],
 
     # 3. Code Syntax & Language Grammar Rules (For the JEPA World Model)
@@ -105,7 +109,8 @@ DATASET_QUEUE = {
         "AlgorithmicResearchGroup/arxiv_cplusplus_research_code",
         "Infatoshi/kernelbench-mega-traces",
         "jedisct1/security-audits",
-        "randomanon000/coding-sessions"
+        "randomanon000/coding-sessions",
+        "nvidia/Nemotron-Pretraining-Code-v3"
     ]
 }
 
@@ -276,12 +281,24 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
             buffer = []
 
             # Dataset specific args
-            load_args = {"path": dataset_name, "split": "train", "streaming": True}
+            # UPDATED: Polymorphic layout mapping for benchmark evaluation splits
+            load_args = {"path": dataset_name, "streaming": True}
+            
             if dataset_name == "HuggingFaceFW/fineweb-edu":
-                load_args["name"] = "sample-10BT"
-            # Add this specific check for MNBVC
+                load_args["name"] = "sample-100BT"
+                load_args["split"] = "train"
             elif dataset_name == "liwu/MNBVC":
-                load_args["name"] = "web_novel" # or "novel" based on your preference
+                load_args["name"] = "web_novel"
+                load_args["split"] = "train"
+            elif dataset_name == "Qwen/AgentWorldBench":
+                # Force loader to look inside the target test split configurations
+                load_args["split"] = "test" 
+            elif dataset_name == "jedisct1/security-audits":
+                # Direct loader to hit the main target repository subset flag
+                load_args["name"] = "all"
+                load_args["split"] = "train"
+            else:
+                load_args["split"] = "train"
 
             try:
                 ds = load_dataset(**load_args)
@@ -303,6 +320,8 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
                 max_rows = 20_000_000
             elif dataset_name == "wdndev/webnovel-chinese":
                 max_rows = 5_000_000   # Solid base for Chinese prose structures
+            elif dataset_name == "nvidia/Nemotron-Pretraining-Code-v3": 
+                max_rows = 20_000_000
             elif domain == "frontier_traces":
                 max_rows = 500_000
             else:

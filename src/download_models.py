@@ -20,6 +20,7 @@ DATASET_QUEUE = {
     # 1. Curated Frontier Model Traces (Reasoning, Alignment & Agentic Flow)
     "frontier_traces": [
         "Crownelius/Complete-FABLE.5-traces-2M",
+        "Qwen/AgentWorldBench",
         "ansulev/claude_mythos_distilled_25k",
         "ox-ox/mythos-character-distillation",
         "11-47/claude_opus_4.8_max_thinking_5k_v2",
@@ -66,7 +67,8 @@ DATASET_QUEUE = {
         "AletheiaResearch/GPT-5.5-Codex",
         "Infatoshi/kernelbench-hard-traces",
         "Quaxicron/Fable-5-traces",
-        "cfahlgren1/Fable-5-traces"
+        "cfahlgren1/Fable-5-traces",
+        "nvidia/Nemotron-Posttraining-v3"
     ],
 
     # 2. Massive General Knowledge, Instruction Following, & Creative Core
@@ -89,7 +91,9 @@ DATASET_QUEUE = {
         "wdndev/webnovel-chinese",
         # Moved basic comprehension datasets here
         "rajpurkar/squad",
-        "google/boolq"
+        "google/boolq",
+        "nvidia/Nemotron-Pretraining-Legal-v1",
+        "nvidia/Nemotron-Pretraining-Specialized-v1.2"
     ],
 
     # 3. Code Syntax & Language Grammar Rules (For the JEPA World Model)
@@ -108,7 +112,8 @@ DATASET_QUEUE = {
         "AlgorithmicResearchGroup/arxiv_cplusplus_research_code",
         "Infatoshi/kernelbench-mega-traces",
         "jedisct1/security-audits",
-        "randomanon000/coding-sessions"
+        "randomanon000/coding-sessions",
+        "nvidia/Nemotron-Pretraining-Code-v3"
     ]
 }
 
