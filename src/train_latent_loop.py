@@ -20,7 +20,7 @@ except ImportError:
 
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.model_architecture import Mamba2LatentLoop8B, MambaJEPAEngine, DualStageLatentDecoder
+from src.model_architecture import Mamba2LatentLoop8B, MambaJEPAEngine, ClosedLoopLatentDecoder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -110,11 +110,10 @@ def train_loop(
     if device.type == 'cpu':
         logging.warning("Running on CPU, using heavily downgraded hyperparameters to avoid OOM.")
         model = MambaJEPAEngine(d_model=64, num_blocks=2, max_budget=2, d_latent=1024)
-        # FIX: Explicitly name both keyword arguments to prevent positional mismatch
-        decoder = DualStageLatentDecoder(d_latent=1024, d_model=64)
+        decoder = ClosedLoopLatentDecoder(d_latent=1024, d_model=64)
     else:
         model = MambaJEPAEngine()
-        decoder = DualStageLatentDecoder()
+        decoder = ClosedLoopLatentDecoder()
 
     if device.type == "xpu":
         torch._inductor.config.freezing = True
@@ -227,10 +226,7 @@ def train_loop(
                 mamba_state = None
 
                 num_chunks = (seq_len + chunk_size - 1) // chunk_size
-                track_loss = 0.0
-                track_ce = 0.0
-                track_jepa = 0.0
-                track_route = 0.0
+                track_loss, track_ce, track_jepa, track_route = 0.0, 0.0, 0.0, 0.0
 
                 for t in range(0, seq_len, chunk_size):
                     c_input = padded_input[:, t:t+chunk_size]
@@ -238,11 +234,21 @@ def train_loop(
 
                     with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
                         student_concept, global_steps, mamba_state = model(c_input, mamba_state=mamba_state)
-                        logits = decoder(student_concept)
-
-                        min_len = min(logits.size(1), c_qwen.size(1))
-                        logits_aligned = logits[:, :min_len, :]
-                        c_qwen_aligned = c_qwen[:, :min_len]
+                        
+                        # Apply teacher forcing shift logic to train the cross-attended decoder
+                        if c_qwen.size(1) > 1:
+                            decoder_input = c_qwen[:, :-1]
+                            decoder_target = c_qwen[:, 1:]
+                            
+                            logits = decoder(decoder_input, student_concept)
+                            
+                            min_len = min(logits.size(1), decoder_target.size(1))
+                            logits_aligned = logits[:, :min_len, :]
+                            c_qwen_aligned = decoder_target[:, :min_len]
+                        else:
+                            logits = decoder(c_qwen, student_concept)
+                            logits_aligned = logits
+                            c_qwen_aligned = c_qwen
 
                         completed_opt_steps = lr_scheduler.last_epoch
                         lambda_jepa = get_lambda_jepa(completed_opt_steps, warmup_steps=1000)
@@ -290,14 +296,13 @@ def train_loop(
                     with open(csv_filename, mode='a', newline='') as f:
                         writer = csv.writer(f)
                         writer.writerow([epoch+1, actual_chunk_idx+1, global_mb_step, avg_ce, avg_jepa, avg_route, avg_loss])
+                        
         if global_mb_step % accumulation_steps != 0:
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
             if hasattr(torch.xpu, 'empty_cache'):
                 torch.xpu.empty_cache()
-
-
 
         accelerator.save_state(checkpoint_dir)
         if accelerator.is_main_process:

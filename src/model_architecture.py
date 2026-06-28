@@ -4,25 +4,27 @@ import torch.nn.functional as F
 
 class MambaGraphRouter(nn.Module):
     """
-    Arbitrary Layer Graph Routing (ALGR) Head.
-    Evaluates hidden states and routes tokens dynamically.
+    Upgraded ALGR Head incorporating Einstein World Model sparse tool-activation gates.
+    Routes tokens dynamically while exposing an explicit World-Module Query Trigger index.
     """
     def __init__(self, d_model=6144, num_blocks=32):
         super().__init__()
         self.num_blocks = num_blocks
-        self.routing_head = nn.Linear(d_model, num_blocks + 1)
+        # Dimension allocation: num_blocks (layers), 1 (standard exit), 1 (world-module trigger)
+        self.routing_head = nn.Linear(d_model, num_blocks + 2)
 
     def forward(self, h, global_steps, max_budget=64):
-        # h: [Batch, Seq_Len, d_model]
-        # global_steps: [Batch, Seq_Len, 1]
         logits = self.routing_head(h)
-
-        # Force route to exit state (index -1) if computational budget is exhausted
+        
+        # Force terminate if computation budget is completely exhausted
         mask = (global_steps >= max_budget).float()
         mask_sq = mask.squeeze(-1)
-        logits[:, :, :-1] = logits[:, :, :-1] * (1.0 - mask) - (mask * 1e9)
-        logits[:, :, -1] = logits[:, :, -1] * (1.0 - mask_sq) + (mask_sq * 1e9)
-
+        
+        # Suppress active computation paths if budget is blown
+        logits[:, :, :-2] = logits[:, :, :-2] * (1.0 - mask) - (mask * 1e9)
+        # Shift all residual mass to the explicit exit coordinate (index -2)
+        logits[:, :, -2] = logits[:, :, -2] * (1.0 - mask_sq) + (mask_sq * 1e9)
+        
         return F.softmax(logits, dim=-1)
 
 class Mamba2SSDBlock(nn.Module):
@@ -175,6 +177,56 @@ class MambaJEPAEngine(nn.Module):
         student_concept = self.projection_head(hidden_state)
 
         return student_concept, global_steps, mamba_state
+
+class ClosedLoopLatentDecoder(nn.Module):
+    """
+    Upgraded Decoder mapping to EWM principles.
+    Treats the latent concept vector as an examineable canvas conditioned via cross-attention.
+    """
+    def __init__(self, d_latent=1024, max_seq_len=256, d_model=6144, vocab_size=151643):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.d_model = d_model
+        
+        # Map the static JEPA concept vector to an addressable memory trace sequence
+        self.concept_to_memory = nn.Linear(d_latent, 16 * d_model) # 16 key frame context slots
+        
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        
+        # Transition from a standard encoder to a Decoder Layer with cross-attention capabilities
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=16,
+            dim_feedforward=d_model * 4,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=4)
+        self.output_proj = nn.Linear(d_model, vocab_size)
+
+    def forward(self, target_tokens, concept_vector):
+        batch_size = concept_vector.size(0)
+        seq_len = target_tokens.size(1)
+        
+        # 1. Project the concept vector into explicit "inspectable frames" memory
+        concept_memory = self.concept_to_memory(concept_vector).view(batch_size, 16, self.d_model)
+        
+        # 2. Embed the text reasoning tokens
+        token_embeddings = self.token_embedding(target_tokens)
+        
+        # 3. Create causal mask for token sequence text autoregression
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(concept_vector.device)
+        
+        # 4. Decode text conditioned directly on the externalized latent concept matrix via cross-attention
+        decoded_seq = self.transformer_decoder(
+            tgt=token_embeddings,
+            memory=concept_memory,
+            tgt_mask=causal_mask,
+            tgt_is_causal=True
+        )
+        
+        return self.output_proj(decoded_seq)
 
 class DualStageLatentDecoder(nn.Module):
     def __init__(self, d_latent=1024, max_seq_len=256, d_model=6144, vocab_size=151643):

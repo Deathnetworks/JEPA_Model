@@ -16,7 +16,8 @@ except ImportError:
 
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.model_architecture import DualStageLatentDecoder
+# Switch import from the old feed-forward stage to the cross-attention loop architecture
+from src.model_architecture import ClosedLoopLatentDecoder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -61,9 +62,9 @@ def train_decoder_loop(
 
     if device.type == 'cpu':
         logging.warning("Running on CPU, using heavily downgraded hyperparameters to avoid OOM.")
-        model = DualStageLatentDecoder(d_model=64, d_latent=1024).to(device)
+        model = ClosedLoopLatentDecoder(d_model=64, d_latent=1024).to(device)
     else:
-        model = DualStageLatentDecoder().to(device)
+        model = ClosedLoopLatentDecoder().to(device)
 
     model.train()
 
@@ -75,7 +76,6 @@ def train_decoder_loop(
     )
 
     criterion = nn.CrossEntropyLoss(ignore_index=0)
-
     dataloader = get_decoder_dataloader(data_dir=data_dir, batch_size=1)
 
     csv_filename = "decoder_training_trace.csv"
@@ -101,23 +101,29 @@ def train_decoder_loop(
                 target_concept = torch.stack(target_concepts_list).to(device)
 
                 max_len = model.max_seq_len
-                qwen_tokens_list_sliced = [tokens[:max_len] for tokens in qwen_tokens_list]
+                # Slice target sequence to max_len + 1 to safely capture autoregressive shifted offsets
+                qwen_tokens_list_sliced = [tokens[:max_len + 1] for tokens in qwen_tokens_list]
 
                 qwen_tokens = torch.nn.utils.rnn.pad_sequence(qwen_tokens_list_sliced, batch_first=True, padding_value=0).to(device).long()
 
                 seq_len_current = qwen_tokens.shape[1]
-                if seq_len_current < max_len:
-                    padding = torch.zeros((qwen_tokens.shape[0], max_len - seq_len_current), dtype=qwen_tokens.dtype, device=device)
+                if seq_len_current < max_len + 1:
+                    padding = torch.zeros((qwen_tokens.shape[0], (max_len + 1) - seq_len_current), dtype=qwen_tokens.dtype, device=device)
                     qwen_tokens = torch.cat([qwen_tokens, padding], dim=1)
+
+                # Teacher Forcing: Shift targets to split tokens into inputs and expected labels
+                decoder_input = qwen_tokens[:, :-1]   # Tokens [0, 1, ..., max_len - 1]
+                decoder_target = qwen_tokens[:, 1:]    # Tokens [1, 2, ..., max_len]
 
                 optimizer.zero_grad()
 
                 with torch.autocast(device_type="xpu" if device.type == "xpu" else "cpu", dtype=torch.bfloat16 if device.type == "xpu" else torch.float32):
-                    logits = model(target_concept)
+                    # Forward pass conditions token generation on both history and the concept vector
+                    logits = model(decoder_input, target_concept)
 
                     batch_size, seq_len, vocab_size = logits.shape
                     logits_flat = logits.view(batch_size * seq_len, vocab_size)
-                    qwen_tokens_flat = qwen_tokens.view(-1)
+                    qwen_tokens_flat = decoder_target.view(-1)
 
                     loss = criterion(logits_flat, qwen_tokens_flat)
 

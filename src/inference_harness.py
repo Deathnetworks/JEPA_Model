@@ -12,14 +12,15 @@ except ImportError:
 
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.model_architecture import MambaJEPAEngine, DualStageLatentDecoder
+from src.model_architecture import MambaJEPAEngine, ClosedLoopLatentDecoder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
 def extract_rust_code(text: str) -> str:
     """Extracts Rust code from a markdown block or returns the text itself."""
-    match = re.search(r"```(?:rust)?\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    # Uses hex escape sequences (\x60) for backticks to completely prevent markdown renderer truncation
+    match = re.search(r"\x60\x60\x60(?:rust)?\n(.*?)\x60\x60\x60", text, re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1).strip()
     return text.strip()
@@ -48,14 +49,14 @@ class InferencePipeline:
             else:
                 self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
-        logging.info("Instantiating MambaJEPAEngine and DualStageLatentDecoder...")
+        logging.info("Instantiating MambaJEPAEngine and ClosedLoopLatentDecoder...")
         if self.device.type == 'cpu':
             logging.warning("Running on CPU, using heavily downgraded hyperparameters to avoid OOM.")
             self.engine = MambaJEPAEngine(d_model=64, num_blocks=2, max_budget=2, d_latent=1024).to(self.device)
-            self.decoder = DualStageLatentDecoder(d_model=64, d_latent=1024).to(self.device)
+            self.decoder = ClosedLoopLatentDecoder(d_model=64, d_latent=1024).to(self.device)
         else:
             self.engine = MambaJEPAEngine().to(self.device)
-            self.decoder = DualStageLatentDecoder().to(self.device)
+            self.decoder = ClosedLoopLatentDecoder().to(self.device)
 
         if self.device.type == "xpu":
             torch._inductor.config.freezing = True
@@ -108,11 +109,22 @@ class InferencePipeline:
                     if hasattr(torch, 'xpu') and hasattr(torch.xpu, 'empty_cache'):
                         torch.xpu.empty_cache()
 
-                with torch.autocast(device_type="xpu" if self.device.type == "xpu" else "cpu", dtype=torch.bfloat16 if self.device.type == "xpu" else torch.float32):
-                    logits = self.decoder(student_concept)
+                # Enforce complete token-by-token autoregressive cross-attention loop decoding
+                max_gen_len = self.decoder.max_seq_len
+                generated_ids = torch.full((1, 1), self.tokenizer.pad_token_id, dtype=torch.long, device=self.device)
+                
+                for step in range(max_gen_len):
+                    with torch.autocast(device_type="xpu" if self.device.type == "xpu" else "cpu", dtype=torch.bfloat16 if self.device.type == "xpu" else torch.float32):
+                        logits = self.decoder(generated_ids, student_concept)
+                    
+                    next_token_logits = logits[:, -1, :]
+                    next_token_id = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                    generated_ids = torch.cat([generated_ids, next_token_id], dim=1)
+                    
+                    if next_token_id.item() == self.tokenizer.eos_token_id:
+                        break
 
-                token_ids = torch.argmax(logits, dim=-1) # [Batch, 256]
-                decoded_text = self.tokenizer.batch_decode(token_ids, skip_special_tokens=True)[0]
+                decoded_text = self.tokenizer.batch_decode(generated_ids[:, 1:], skip_special_tokens=True)[0]
 
             logging.info(f"\n--- Raw Generated Output (Attempt {attempt + 1}) ---")
             print(decoded_text)
@@ -143,8 +155,9 @@ class InferencePipeline:
                     error_msg = result.stderr
                     current_prompt = f"{prompt}\n\nThe previous attempt failed with:\n{error_msg}\nPlease fix the architectural logic."
 
-            finally:
-                pass
+            except Exception as e:
+                logging.error(f"Compilation execution failed: {e}")
+                break
 
         try:
             if os.path.exists("temp_agent_output.rs"):
