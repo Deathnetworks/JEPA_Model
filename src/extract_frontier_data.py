@@ -164,91 +164,82 @@ def extract_all_strings(data):
     return strings
 
 def extract_qa_pair(row, dataset_name):
-    """
-    Polymorphic parser to extract prompt/response pairs from diverse dataset schemas.
-    Returns (prompt: str, response: str) or (None, None) if unavailable.
-    """
-    prompt, response = None, None
-
     try:
-        # Aggressive recursive search for 'messages' or 'conversations'
-        messages = find_key_recursive(row, "messages")
-        if not messages:
-            messages = find_key_recursive(row, "conversations")
-
-        if messages and isinstance(messages, list) and len(messages) >= 2:
-            prompt_parts = []
-            response_content = None
-
-            # Find the first user message
-            for msg in messages:
-                if not isinstance(msg, dict): continue
-                role = str(msg.get("role", msg.get("from", ""))).lower()
-                content = stringify_complex(msg.get("content", msg.get("value", "")))
-
-                if role in ["system", "user", "human", "prompter"] and not prompt_parts:
-                    prompt_parts.append(f"{role}: {content}")
-                    break # just get the first one for prompt
-
-            # Find the last assistant message
-            for msg in reversed(messages):
-                if not isinstance(msg, dict): continue
-                role = str(msg.get("role", msg.get("from", ""))).lower()
-                content = stringify_complex(msg.get("content", msg.get("value", "")))
-
-                if role in ["assistant", "bot", "model", "gpt"]:
-                    response_content = content
-                    break
-
-            if prompt_parts and response_content:
-                prompt = "\n".join(prompt_parts)
-                return prompt, response_content
-
-        # Instruction / Output
-        if "instruction" in row and "output" in row:
-            instruction = stringify_complex(row["instruction"])
-            if "input" in row and row["input"]:
-                instruction += "\n" + stringify_complex(row["input"])
-            return instruction, stringify_complex(row["output"])
-
-        # Prompt / Response
-        if "prompt" in row and "response" in row:
-            return stringify_complex(row["prompt"]), stringify_complex(row["response"])
-
-        if "prompt" in row and "completion" in row:
-            return stringify_complex(row["prompt"]), stringify_complex(row["completion"])
-            
-        # Add this rule inside your extract_qa_pair function in extract_frontier_data.py
         if "zh" in row and "en" in row:
             return stringify_complex(row["zh"]), stringify_complex(row["en"])
+        if "prompt" in row and "completion" in row:
+            return stringify_complex(row["prompt"]), stringify_complex(row["completion"])
+        if "current_prompt" in row and "response" in row:
+            return stringify_complex(row["current_prompt"]), stringify_complex(row["response"])
 
-        if "source" in row and "target" in row:
-            # Verify if it's the Chinese translation partition
-            return stringify_complex(row["source"]), stringify_complex(row["target"])
+        messages = None
+        
+        if isinstance(row, dict) and "responses_create_params" in row:
+            params = row["responses_create_params"]
+            if isinstance(params, dict) and "input" in params:
+                messages = params["input"]
 
-        # Text only (fineweb-edu, etc.)
+        if not messages and isinstance(row, dict):
+            for k, v in row.items():
+                if isinstance(v, list) and len(v) >= 1 and isinstance(v[0], (dict, str)):
+                    messages = v
+                    break
+
+        if not messages: messages = find_key_recursive(row, "messages")
+        if not messages: messages = find_key_recursive(row, "conversations")
+        if not messages: messages = find_key_recursive(row, "trajectory")
+
+        if messages and isinstance(messages, list) and len(messages) >= 1:
+            prompt_parts = []
+            response_parts = []
+            
+            for idx, msg in enumerate(messages):
+                if isinstance(msg, str):
+                    role = "system_event" if idx % 2 == 0 else "agent_action"
+                    content = msg
+                elif isinstance(msg, dict):
+                    role = str(msg.get("role", msg.get("from", msg.get("uid", "turn")))).lower()
+                    content = stringify_complex(msg.get("content", msg.get("value", msg.get("text", ""))))
+                else:
+                    continue
+                
+                if idx == 0 or (idx == 1 and role in ["user", "human", "prompter"] and len(prompt_parts) <= 1):
+                    prompt_parts.append(f"{role}: {content}")
+                else:
+                    response_parts.append(f"[{role}]: {content}")
+            
+            if prompt_parts:
+                prompt_str = "\n".join(prompt_parts)
+                response_str = "\n".join(response_parts) if response_parts else "completed"
+                return prompt_str, response_str
+
+        if "instruction" in row and "output" in row:
+            prompt = stringify_complex(row["instruction"])
+            if "input" in row and row["input"] and isinstance(row["input"], str): 
+                prompt += f"\n\nContext: {stringify_complex(row['input'])}"
+            return prompt, stringify_complex(row["output"])
+
+        if "prompt" in row and "response" in row:
+            return stringify_complex(row["prompt"]), stringify_complex(row["response"])
+        if "question" in row and "answer" in row:
+            return stringify_complex(row["question"]), stringify_complex(row["answer"])
+        if "role" in row and "content" in row:
+            return stringify_complex(row["role"]), stringify_complex(row["content"])
+
         if "text" in row:
             text = stringify_complex(row["text"])
-            # Artificial split: take first half as prompt, second as response for auto-encoding tasks
-            mid = len(text) // 2
-            if mid > 0:
-                prompt = text[:mid]
-                response = text[mid:]
-                return prompt, response
+            if len(text) > 10:
+                mid = len(text) // 2
+                return text[:mid], text[mid:]
 
-        # Ultimate fallback: Find the longest string in the entire row
         all_strings = extract_all_strings(row)
         if all_strings:
             longest_string = max(all_strings, key=len)
             if len(longest_string) > 10:
                 mid = len(longest_string) // 2
-                prompt = longest_string[:mid]
-                response = longest_string[mid:]
-                return prompt, response
-
-    except Exception as e:
-        logging.debug(f"Failed to parse row: {e}")
-
+                return longest_string[:mid], longest_string[mid:]
+    except Exception:
+        pass
     return None, None
 
 
@@ -280,10 +271,8 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
             chunk_id = 0
             buffer = []
 
-            # Dataset specific args
-            # UPDATED: Polymorphic layout mapping for benchmark evaluation splits
+            # Smarter Configuration Parser Map
             load_args = {"path": dataset_name, "streaming": True}
-            
             if dataset_name == "HuggingFaceFW/fineweb-edu":
                 load_args["name"] = "sample-100BT"
                 load_args["split"] = "train"
@@ -291,14 +280,15 @@ def process_datasets(save_dir=r"F:\JEPA_Model\data\shards", chunk_size=1000):
                 load_args["name"] = "web_novel"
                 load_args["split"] = "train"
             elif dataset_name == "Qwen/AgentWorldBench":
-                # Force loader to look inside the target test split configurations
-                load_args["split"] = "test" 
+                load_args["split"] = "test"
             elif dataset_name == "jedisct1/security-audits":
-                # Direct loader to hit the main target repository subset flag
                 load_args["name"] = "all"
                 load_args["split"] = "train"
+            elif dataset_name == "nvidia/compute-eval":
+                load_args["split"] = "eval"
             else:
                 load_args["split"] = "train"
+
 
             try:
                 ds = load_dataset(**load_args)
