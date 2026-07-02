@@ -43,34 +43,11 @@ class TripartiteLoss(nn.Module):
         # 2. JEPA Alignment Loss (Positive Pairs)
         l_jepa_align = 1 - F.cosine_similarity(student_concept, target_concept, dim=-1).mean()
         
-        # --- NEW: Axiom of Separability (In-Batch Contrastive Repulsion) ---
-        if batch_size > 1:
-            norm_student = F.normalize(student_concept, dim=-1)
-            # Compute cosine similarity between all items in the batch
-            sim_matrix = torch.matmul(norm_student, norm_student.T) 
-            # Mask out the diagonal (self-similarity)
-            off_diag_mask = ~torch.eye(batch_size, dtype=torch.bool, device=sim_matrix.device)
-            # Penalize the model if different questions share the same latent thought
-            l_separability = torch.clamp(sim_matrix[off_diag_mask], min=0.0).mean()
-        else:
-            l_separability = torch.tensor(0.0, device=logits.device)
+        # --- DELTA-JEPA UPGRADE: Heavy Contrastive Matrices Removed ---
+        # Latent difference decoding inherently prevents dimensional collapse, saving massive VRAM.
+        l_jepa = l_jepa_align
 
-        # NEW 3. Spectral Contrastive Uniformity Loss (From arXiv:2606.27014)
-        flat_student = student_concept.view(-1, student_concept.size(-1))
-        flat_student = flat_student - flat_student.mean(dim=0) 
-        
-        # CRITICAL FIX: Prevent Division by Zero when Batch Size == 1
-        if flat_student.size(0) > 1:
-            cov = torch.matmul(flat_student.T, flat_student) / (flat_student.size(0) - 1)
-            off_diag_mask = ~torch.eye(cov.size(0), dtype=torch.bool, device=cov.device)
-            l_spectral = (cov[off_diag_mask] ** 2).mean()
-        else:
-            l_spectral = torch.tensor(0.0, device=logits.device)
-
-        # Combine alignment and spectral uniformity into the total JEPA objective
-        l_jepa = l_jepa_align + (self.lambda_spectral * l_spectral) + (0.5 * l_separability)
-
-        # 4. Routing Penalty Loss (Compute Budget)
+        # 3. Routing Penalty Loss (Compute Budget)
         avg_loops = global_steps.float().mean() if global_steps.dtype != torch.float32 else global_steps.mean()
         if avg_loops > self.max_loops:
             l_route = (avg_loops - self.max_loops) ** 2
@@ -80,7 +57,6 @@ class TripartiteLoss(nn.Module):
         # Encourages the final latent thought to settle into a low-energy, resolved state
         l_energy_contraction = torch.norm(student_concept, p=2, dim=-1).mean() * 0.001
 
-        # Add to total loss
         total_loss = l_ce + (lambda_jepa * l_jepa) + (self.lambda_route * l_route) + l_energy_contraction
         return total_loss, l_ce, l_jepa, l_route
 
@@ -127,9 +103,18 @@ def collate_jepa_chunk(batch):
         return None
     return flattened
 
-def get_dataloader(data_dir=r"F:\JEPA_Model\data\shards", batch_size=1, num_workers=0, curriculum_phase="frontier_traces"):
+def get_dataloader(data_dir=r"F:\JEPA_Model\data\shards", batch_size=1, num_workers=2, curriculum_phase="frontier_traces"):
     dataset = JEPADataset(data_dir, curriculum_phase=curriculum_phase)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_jepa_chunk)
+    # --- NEW: Asynchronous Data Prefetching (Thanks Emre!) ---
+    return DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers, 
+        collate_fn=collate_jepa_chunk,
+        pin_memory=True,       # Stages tensors in page-locked RAM for instant PCIe transfer
+        prefetch_factor=2      # CPU prepares the next 2 batches in the background
+    )
 
 
 def train_loop(
@@ -259,6 +244,7 @@ def train_loop(
 
                 seq_len = padded_input.size(1)
                 mamba_state = None
+                prev_student_concept = None # --- NEW: Delta-JEPA state tracking ---
 
                 num_chunks = (seq_len + chunk_size - 1) // chunk_size
                 track_loss, track_ce, track_jepa, track_route = 0.0, 0.0, 0.0, 0.0
@@ -275,7 +261,8 @@ def train_loop(
                             decoder_input = c_qwen[:, :-1]
                             decoder_target = c_qwen[:, 1:]
                             
-                            logits = decoder(decoder_input, student_concept)
+                            # --- NEW: Pass previous concept for Latent Difference Decoding ---
+                            logits = decoder(decoder_input, student_concept, prev_student_concept)
                             
                             min_len = min(logits.size(1), decoder_target.size(1))
                             logits_aligned = logits[:, :min_len, :]
@@ -285,6 +272,9 @@ def train_loop(
                             logits_aligned = logits
                             c_qwen_aligned = c_qwen
 
+                        # Cache the current concept for the next sequence chunk
+                        prev_student_concept = student_concept.detach()
+                        
                         completed_opt_steps = lr_scheduler.last_epoch
                         lambda_jepa = get_lambda_jepa(completed_opt_steps, warmup_steps=1000)
 

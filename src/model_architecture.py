@@ -203,12 +203,21 @@ class MambaJEPAEngine(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.mamba_loop = Mamba2LatentLoop8B(d_model=d_model, num_blocks=num_blocks, max_budget=max_budget)
         self.projection_head = LatentProjectionHead(d_model=d_model, d_latent=d_latent)
+        
+        # --- NEW: FC-RL Foresight Success Estimator (arXiv:2606.27483) ---
+        # Acts as an internal world model Q-value estimator directly on the latent rollout
+        self.foresight_head = nn.Sequential(
+            nn.Linear(d_latent, 256),
+            nn.SiLU(),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+        
         self.max_budget = max_budget
 
     def forward(self, input_tokens, mamba_state=None, active_budget=None):
         hidden_state = self.embedding(input_tokens)
         
-        # --- NEW: Inference / Stochastic Budgeting Override ---
         if active_budget is None:
             active_budget = self.max_budget
         
@@ -219,11 +228,13 @@ class MambaJEPAEngine(nn.Module):
             input_tokens, 
             hidden_state=hidden_state, 
             mamba_state=mamba_state, 
-            active_budget=active_budget # Pass dynamic cap to the loop
+            active_budget=active_budget
         )
 
         student_concept = self.projection_head(hidden_state)
 
+        # Note: We do NOT alter the return signature to prevent breaking train_latent_loop.py unpacking.
+        # The foresight head will be invoked sequentially during the GRPO phase.
         return student_concept, global_steps, mamba_state
 
 class ClosedLoopLatentDecoder(nn.Module):
@@ -247,12 +258,19 @@ class ClosedLoopLatentDecoder(nn.Module):
         self.output_proj = nn.Linear(d_model, vocab_size, bias=False)
         self.output_proj.weight = self.token_embedding.weight # Eliminates the tying gap
 
-    def forward(self, target_tokens, concept_vector):
+    def forward(self, target_tokens, concept_vector, prev_concept_vector=None):
         batch_size = concept_vector.size(0)
         seq_len = target_tokens.size(1)
         
-        # 1. Project the concept vector into explicit "inspectable frames" memory
-        concept_memory = self.concept_to_memory(concept_vector).view(batch_size, 16, self.d_model)
+        # --- NEW: Delta-JEPA Latent Difference (arXiv:2606.31232) ---
+        # Reconstruct the code structure from the geometric displacement of the thought
+        if prev_concept_vector is not None:
+            delta_concept = concept_vector - prev_concept_vector
+        else:
+            delta_concept = concept_vector
+        
+        # 1. Project the displacement vector into explicit "inspectable frames" memory
+        concept_memory = self.concept_to_memory(delta_concept).view(batch_size, 16, self.d_model)
         
         # 2. Embed the text reasoning tokens
         token_embeddings = self.token_embedding(target_tokens)
@@ -260,7 +278,7 @@ class ClosedLoopLatentDecoder(nn.Module):
         # 3. Create causal mask for token sequence text autoregression
         causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(concept_vector.device)
         
-        # 4. Decode text conditioned directly on the externalized latent concept matrix via cross-attention
+        # 4. Decode text conditioned directly on the externalized latent displacement via cross-attention
         decoded_seq = self.transformer_decoder(
             tgt=token_embeddings,
             memory=concept_memory,

@@ -110,6 +110,15 @@ class GRPOLearningEngine:
         for idx in range(group_size):
             # Re-evaluate log probabilities with active gradients
             student_concept, _, _ = self.model(prompt_tokens)
+            
+            # --- NEW: Foresight-Conditioned Calibration (arXiv:2606.27483) ---
+            # The agent predicts its success probability directly from its latent state rollout
+            predicted_success = self.model.foresight_head(student_concept).squeeze(-1)
+            actual_success = torch.tensor([group_rewards[idx]], dtype=torch.float32, device=device)
+            
+            # Penalize the world model if it cannot accurately predict compiler outcomes
+            l_foresight = F.mse_loss(predicted_success, actual_success).mean()
+            
             logits = self.decoder(group_tokens[idx], student_concept)
             
             log_probs_current = F.log_softmax(logits, dim=-1)
@@ -123,6 +132,8 @@ class GRPOLearningEngine:
             surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages[idx]
             
             loss = -torch.min(surr1, surr2).mean()
-            total_loss += loss
+            
+            # --- NEW: Combine Policy Loss with Foresight Grounding ---
+            total_loss += loss + (0.5 * l_foresight)
 
         return total_loss

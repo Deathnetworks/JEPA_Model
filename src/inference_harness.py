@@ -13,6 +13,7 @@ except ImportError:
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.model_architecture import MambaJEPAEngine, ClosedLoopLatentDecoder
+from src.GRPOLearningEngine import GRPOLearningEngine # --- NEW ---
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -80,6 +81,14 @@ class InferencePipeline:
 
         self.engine.eval()
         self.decoder.eval()
+        
+        # --- NEW: AdaJEPA Test-Time Optimizer ---
+        # Instantiate AdamW and the GRPO engine for single-step test-time adaptation
+        self.optimizer = torch.optim.AdamW(
+            list(self.engine.parameters()) + list(self.decoder.parameters()), 
+            lr=1e-5
+        )
+        self.grpo = GRPOLearningEngine(self.engine, self.decoder, self.tokenizer)
 
     def generate_code(self, prompt: str, max_retries: int = 3):
         current_prompt = prompt
@@ -162,6 +171,22 @@ class InferencePipeline:
                 else:
                     logging.warning(f"Rust compilation FAILED. Exit code {result.returncode}")
                     error_msg = result.stderr
+                    
+                    # --- NEW: AdaJEPA Test-Time Adaptation (arXiv:2606.32026) ---
+                    logging.info("Applying AdaJEPA Test-Time Penalty Step...")
+                    
+                    # 1. Execute a fast GRPO surrogate loss calculation (group_size 2 for speed)
+                    loss = self.grpo.train_grpo_step(inputs["input_ids"], self.optimizer, group_size=2)
+                    
+                    # 2. Backpropagate the penalty to physically force the router to adjust its trajectory
+                    loss.backward()
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    
+                    # 3. Return models to rigid inference mode
+                    self.engine.eval()
+                    self.decoder.eval()
+                    
                     current_prompt = f"{prompt}\n\nThe previous attempt failed with:\n{error_msg}\nPlease fix the architectural logic."
 
             except Exception as e:

@@ -47,9 +47,18 @@ def collate_decoder_chunk(batch):
         return None
     return flattened
 
-def get_decoder_dataloader(data_dir=r"F:\JEPA_Model\data\shards", batch_size=1, num_workers=0):
+def get_decoder_dataloader(data_dir=r"F:\JEPA_Model\data\shards", batch_size=1, num_workers=2):
     dataset = DecoderDataset(data_dir)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_decoder_chunk)
+    # --- NEW: Asynchronous Data Prefetching (Thanks Emre!) ---
+    return DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers, 
+        collate_fn=collate_decoder_chunk,
+        pin_memory=True,       # Stages tensors in page-locked RAM for instant PCIe transfer
+        prefetch_factor=2      # CPU prepares the next 2 batches in the background
+    )
 
 def train_decoder_loop(
     epochs=10,
