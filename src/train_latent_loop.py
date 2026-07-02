@@ -25,28 +25,63 @@ from src.model_architecture import Mamba2LatentLoop8B, MambaJEPAEngine, ClosedLo
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class TripartiteLoss(nn.Module):
-    def __init__(self, max_loops=4):
+    def __init__(self, max_loops=4, lambda_spectral=0.1):
         super().__init__()
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=0)
         self.max_loops = max_loops
         self.lambda_route = 0.01
+        self.lambda_spectral = lambda_spectral # NEW: Coefficient for Spectral Uniformity
 
     def forward(self, logits, qwen_tokens, student_concept, target_concept, global_steps, lambda_jepa):
         batch_size, seq_len, vocab_size = logits.shape
         logits_flat = logits.view(batch_size * seq_len, vocab_size)
         qwen_tokens_flat = qwen_tokens.reshape(-1)
 
+        # 1. Cross-Entropy Loss (Text Generation)
         l_ce = self.ce_loss(logits_flat, qwen_tokens_flat)
 
-        l_jepa = 1 - F.cosine_similarity(student_concept, target_concept, dim=-1).mean()
+        # 2. JEPA Alignment Loss (Positive Pairs)
+        l_jepa_align = 1 - F.cosine_similarity(student_concept, target_concept, dim=-1).mean()
+        
+        # --- NEW: Axiom of Separability (In-Batch Contrastive Repulsion) ---
+        if batch_size > 1:
+            norm_student = F.normalize(student_concept, dim=-1)
+            # Compute cosine similarity between all items in the batch
+            sim_matrix = torch.matmul(norm_student, norm_student.T) 
+            # Mask out the diagonal (self-similarity)
+            off_diag_mask = ~torch.eye(batch_size, dtype=torch.bool, device=sim_matrix.device)
+            # Penalize the model if different questions share the same latent thought
+            l_separability = torch.clamp(sim_matrix[off_diag_mask], min=0.0).mean()
+        else:
+            l_separability = torch.tensor(0.0, device=logits.device)
 
+        # NEW 3. Spectral Contrastive Uniformity Loss (From arXiv:2606.27014)
+        flat_student = student_concept.view(-1, student_concept.size(-1))
+        flat_student = flat_student - flat_student.mean(dim=0) 
+        
+        # CRITICAL FIX: Prevent Division by Zero when Batch Size == 1
+        if flat_student.size(0) > 1:
+            cov = torch.matmul(flat_student.T, flat_student) / (flat_student.size(0) - 1)
+            off_diag_mask = ~torch.eye(cov.size(0), dtype=torch.bool, device=cov.device)
+            l_spectral = (cov[off_diag_mask] ** 2).mean()
+        else:
+            l_spectral = torch.tensor(0.0, device=logits.device)
+
+        # Combine alignment and spectral uniformity into the total JEPA objective
+        l_jepa = l_jepa_align + (self.lambda_spectral * l_spectral) + (0.5 * l_separability)
+
+        # 4. Routing Penalty Loss (Compute Budget)
         avg_loops = global_steps.float().mean() if global_steps.dtype != torch.float32 else global_steps.mean()
         if avg_loops > self.max_loops:
             l_route = (avg_loops - self.max_loops) ** 2
         else:
             l_route = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
 
-        total_loss = l_ce + (lambda_jepa * l_jepa) + (self.lambda_route * l_route)
+        # Encourages the final latent thought to settle into a low-energy, resolved state
+        l_energy_contraction = torch.norm(student_concept, p=2, dim=-1).mean() * 0.001
+
+        # Add to total loss
+        total_loss = l_ce + (lambda_jepa * l_jepa) + (self.lambda_route * l_route) + l_energy_contraction
         return total_loss, l_ce, l_jepa, l_route
 
 def get_lambda_jepa(step, warmup_steps=1000):

@@ -4,17 +4,19 @@ import torch.nn.functional as F
 
 class MambaGraphRouter(nn.Module):
     """
-    Upgraded ALGR Head incorporating Einstein World Model sparse tool-activation gates.
-    Routes tokens dynamically while exposing an explicit World-Module Query Trigger index.
+    Upgraded ALGR Head incorporating Einstein World Model sparse tool-activation gates
+    and Fixed-Point Halting Signals (arXiv:2604.11791).
     """
     def __init__(self, d_model=6144, num_blocks=32):
         super().__init__()
         self.num_blocks = num_blocks
-        # Dimension allocation: num_blocks (layers), 1 (standard exit), 1 (world-module trigger)
-        self.routing_head = nn.Linear(d_model, num_blocks + 2)
+        # NEW: Input dimension is d_model + 1 (to accept the h_delta L2 distance)
+        self.routing_head = nn.Linear(d_model + 1, num_blocks + 2)
 
-    def forward(self, h, global_steps, max_budget=64):
-        logits = self.routing_head(h)
+    def forward(self, h, h_delta, global_steps, max_budget=64):
+        # Concatenate the latent state with the continuous convergence signal
+        router_input = torch.cat([h, h_delta], dim=-1)
+        logits = self.routing_head(router_input)
         
         # Force terminate if computation budget is completely exhausted
         mask = (global_steps >= max_budget).float()
@@ -22,7 +24,6 @@ class MambaGraphRouter(nn.Module):
         
         # Suppress active computation paths if budget is blown
         logits[:, :, :-2] = logits[:, :, :-2] * (1.0 - mask) - (mask * 1e9)
-        # Shift all residual mass to the explicit exit coordinate (index -2)
         logits[:, :, -2] = logits[:, :, -2] * (1.0 - mask_sq) + (mask_sq * 1e9)
         
         return F.softmax(logits, dim=-1)
@@ -104,15 +105,22 @@ class Mamba2LatentLoop8B(nn.Module):
         self.embedding_global = nn.Embedding(max_budget + 1, d_model)
         self.embedding_block = nn.Embedding(num_blocks + 1, d_model)
 
+        # --- NEW: Spectral Injection Constraints (Parcae - arXiv:2604.12946) ---
+        # Learned continuous parameterization to guarantee spectral radius < 1
+        self.A_log_spectral = nn.Parameter(torch.randn(d_model))
+
         self.blocks = nn.ModuleList([Mamba2SSDBlock(d_model=d_model) for _ in range(num_blocks)])
         self.routers = nn.ModuleList([MambaGraphRouter(d_model=d_model, num_blocks=num_blocks) for _ in range(num_blocks)])
 
-    def forward(self, tokens, hidden_state=None, mamba_state=None):
+    def forward(self, tokens, hidden_state=None, mamba_state=None, active_budget=64):
         if hidden_state is None:
             hidden_state = torch.zeros(tokens.shape[0], tokens.shape[1], self.d_model, device=tokens.device, dtype=tokens.dtype)
 
         batch, seq_len, _ = hidden_state.shape
         global_steps = torch.zeros(batch, seq_len, 1, device=hidden_state.device, dtype=hidden_state.dtype)
+        
+        expected_steps = torch.zeros(batch, seq_len, 1, device=hidden_state.device, dtype=hidden_state.dtype)
+        unhalted_prob = torch.ones(batch, seq_len, 1, device=hidden_state.device, dtype=hidden_state.dtype)
 
         if mamba_state is None:
             mamba_state_list = [None] * self.num_blocks
@@ -123,22 +131,48 @@ class Mamba2LatentLoop8B(nn.Module):
 
         current_block_idx = 0
         new_mamba_state = [None] * self.num_blocks
+        
+        # NEW: Track previous state for Fixed-Point Halting (arXiv:2604.11791)
+        prev_hidden_state = hidden_state.clone()
 
-        while (global_steps < self.max_budget).any() and current_block_idx < self.num_blocks:
+        while (global_steps < active_budget).any() and current_block_idx < self.num_blocks:
+            # --- NEW: Token-Level Active Masking (MoR - arXiv:2507.10524) ---
+            # Create a physical mask of tokens that are still actively "thinking"
+            active_mask = (unhalted_prob > 0.05).float()
+            
             step_env = self.embedding_global(global_steps.squeeze(-1).long())
             block_env = self.embedding_block(torch.full_like(global_steps, current_block_idx).squeeze(-1).long())
 
-            hidden_state = hidden_state + step_env + block_env
+            # --- NEW: Spectral Injection Constraints (Parcae - arXiv:2604.12946) ---
+            # A_discrete = exp(dt * A_continuous) where A_continuous is forced strictly negative
+            A_discrete = torch.exp(-torch.exp(self.A_log_spectral) * 1.0)
+            
+            # Apply stable spectral decay to the residual stream before additive temporal injection
+            hidden_state = (hidden_state * A_discrete) + step_env + block_env
 
             block_out, new_mamba_state[current_block_idx] = self.blocks[current_block_idx](
                 hidden_state, mamba_state_list[current_block_idx]
             )
-            hidden_state = block_out + hidden_state
+            
+            # Apply Token-Level Active Mask to physically gate computation updates
+            hidden_state = (block_out * active_mask) + hidden_state
 
-            route_probs = self.routers[current_block_idx](hidden_state, global_steps, self.max_budget)
+            # --- NEW: Calculate L2 convergence distance for Fixed-Point Halting ---
+            h_delta = torch.norm(hidden_state - prev_hidden_state, dim=-1, keepdim=True)
+            prev_hidden_state = hidden_state.clone()
 
-            global_steps += 1
+            # Pass the convergence signal h_delta to the router
+            route_probs = self.routers[current_block_idx](hidden_state, h_delta, global_steps, self.max_budget)
+            
+            halt_prob = route_probs[:, :, -2].unsqueeze(-1)
+            step_halt_prob = halt_prob * unhalted_prob
+            expected_steps = expected_steps + (global_steps + 1) * step_halt_prob
+            unhalted_prob = unhalted_prob * (1.0 - halt_prob)
+
+            global_steps += active_mask # Only increment budget for tokens still computing
             current_block_idx += 1
+            
+        expected_steps = expected_steps + global_steps * unhalted_prob
 
         for i in range(self.num_blocks):
             if new_mamba_state[i] is None:
@@ -152,7 +186,7 @@ class Mamba2LatentLoop8B(nn.Module):
 
         mamba_state_out = torch.stack(new_mamba_state, dim=1)
 
-        return hidden_state, global_steps, mamba_state_out
+        return hidden_state, expected_steps, mamba_state_out
 
 class LatentProjectionHead(nn.Module):
     def __init__(self, d_model=6144, d_latent=1024):
@@ -169,10 +203,24 @@ class MambaJEPAEngine(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.mamba_loop = Mamba2LatentLoop8B(d_model=d_model, num_blocks=num_blocks, max_budget=max_budget)
         self.projection_head = LatentProjectionHead(d_model=d_model, d_latent=d_latent)
+        self.max_budget = max_budget
 
-    def forward(self, input_tokens, mamba_state=None):
+    def forward(self, input_tokens, mamba_state=None, active_budget=None):
         hidden_state = self.embedding(input_tokens)
-        hidden_state, global_steps, mamba_state = self.mamba_loop(input_tokens, hidden_state=hidden_state, mamba_state=mamba_state)
+        
+        # --- NEW: Inference / Stochastic Budgeting Override ---
+        if active_budget is None:
+            active_budget = self.max_budget
+        
+        if self.training and self.max_budget > 2 and torch.rand(1).item() < 0.3:
+            active_budget = torch.randint(low=2, high=self.max_budget, size=(1,)).item()
+
+        hidden_state, global_steps, mamba_state = self.mamba_loop(
+            input_tokens, 
+            hidden_state=hidden_state, 
+            mamba_state=mamba_state, 
+            active_budget=active_budget # Pass dynamic cap to the loop
+        )
 
         student_concept = self.projection_head(hidden_state)
 
@@ -188,22 +236,16 @@ class ClosedLoopLatentDecoder(nn.Module):
         self.max_seq_len = max_seq_len
         self.d_model = d_model
         
-        # Map the static JEPA concept vector to an addressable memory trace sequence
-        self.concept_to_memory = nn.Linear(d_latent, 16 * d_model) # 16 key frame context slots
+        self.concept_to_memory = nn.Linear(d_latent, 16 * d_model) 
         
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         
-        # Transition from a standard encoder to a Decoder Layer with cross-attention capabilities
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=16,
-            dim_feedforward=d_model * 4,
-            dropout=0.1,
-            activation="gelu",
-            batch_first=True
-        )
+        decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=16, dim_feedforward=d_model * 4, dropout=0.1, activation="gelu", batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=4)
-        self.output_proj = nn.Linear(d_model, vocab_size)
+        
+        # CRITICAL UPGRADE: Remove bias, and physically tie the weights
+        self.output_proj = nn.Linear(d_model, vocab_size, bias=False)
+        self.output_proj.weight = self.token_embedding.weight # Eliminates the tying gap
 
     def forward(self, target_tokens, concept_vector):
         batch_size = concept_vector.size(0)

@@ -100,8 +100,17 @@ class InferencePipeline:
                 for t in range(0, seq_len, chunk_size):
                     chunk_input = input_tokens[:, t:t+chunk_size]
 
+                    # --- NEW: Dynamic Inference Budgeting (arXiv:2604.07822) ---
+                    # Cap the compute loops based on sequence complexity to prevent "Overthinking" degradation.
+                    # Base budget of 8, scaling up by 1 loop per 64 tokens, capped at absolute max (64)
+                    dynamic_budget = min(64, max(8, chunk_input.size(1) // 64))
+
                     with torch.autocast(device_type="xpu" if self.device.type == "xpu" else "cpu", dtype=torch.bfloat16 if self.device.type == "xpu" else torch.float32):
-                        student_concept, _, mamba_state = self.engine(chunk_input, mamba_state=mamba_state)
+                        student_concept, _, mamba_state = self.engine(
+                            chunk_input, 
+                            mamba_state=mamba_state,
+                            active_budget=dynamic_budget # Enforce the mathematical bound
+                        )
 
                     if mamba_state is not None:
                         mamba_state = mamba_state.detach()

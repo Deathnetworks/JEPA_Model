@@ -96,11 +96,11 @@ class GRPOLearningEngine:
 
         # 2. Compute Group Mean and Standard Deviation to derive Advantage Vectors
         rewards_tensor = torch.tensor(group_rewards, dtype=torch.float32, device=device)
-        mu = rewards_rewards_mean = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_tensor = rewards_text_output = torch.tensor(group_rewards, dtype=torch.float32, device=device)
-        mu = group_rewards.mean()
-        sigma = group_rewards.std() if group_size > 1 else torch.tensor(1.0, device=device)
-        if sigma < 1e-6: sigma = 1e-6
-        advantages = (group_rewards - mu) / sigma
+        mu = rewards_tensor.mean()
+        sigma = rewards_tensor.std() if group_size > 1 else torch.tensor(1.0, device=device)
+        if sigma < 1e-6: 
+            sigma = torch.tensor(1e-6, device=device)
+        advantages = (rewards_tensor - mu) / sigma
 
         # 3. Policy Optimization Backpropagation Step
         self.model.train()
@@ -113,16 +113,16 @@ class GRPOLearningEngine:
             logits = self.decoder(group_tokens[idx], student_concept)
             
             log_probs_current = F.log_softmax(logits, dim=-1)
-            target_log_probs = log_probs_sampled_gathered = log_probs_current = logits.gather(-1, group_tokens[idx].unsqueeze(-1)).squeeze(-1)
+            target_log_probs = log_probs_current.gather(-1, group_tokens[idx].unsqueeze(-1)).squeeze(-1)
             
             # Calculate importance sampling ratio
-            ratio = torch.exp(log_probs_current - group_log_probs[idx])
+            ratio = torch.exp(target_log_probs - group_log_probs[idx])
             
             # Compute PPO clipped surrogate objective scaled by Group Advantage
             surr1 = ratio * advantages[idx]
-            surby_clip = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages[idx]
+            surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages[idx]
             
-            loss = -torch.min(surb_clip, surr2).mean()
+            loss = -torch.min(surr1, surr2).mean()
             total_loss += loss
 
         return total_loss
