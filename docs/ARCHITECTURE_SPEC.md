@@ -54,6 +54,16 @@ The 32 physical Mamba-2 layers use a gating routing block to determine execution
 
 $$H_{augmented} = H_{current} + \text{Embedding}_{global}(\text{steps}) + \text{Embedding}_{block}(\text{target\_idx})$$
 
+### 3. Dynamic Halting & Latent Upgrades
+
+The core loops have been upgraded with advanced controls to enforce stability and interpretability:
+
+* **Fixed-Point Halting Signals (arXiv:2604.11791):** The router natively calculates the $L_2$ distance ($h_{delta}$) between the current and previous hidden states. If the token's logic state has converged mathematically, the router outputs a halting signal to stop wasteful recurrence.
+* **Token-Level Active Masking (MoR - arXiv:2507.10524):** Rather than masking globally, active compute budgets are mapped per-token. Tokens that have satisfied their halting threshold receive a zeroed active mask, physically gating computation updates while slower tokens in the sequence continue reasoning.
+* **Spectral Injection Constraints (Parcae - arXiv:2604.12946):** Enforces a strictly negative continuous spectral radius directly on the recurrent states to guarantee numerical stability across extended internal loops.
+* **Delta-JEPA Latent Difference Decoding (arXiv:2606.31232):** In the closed-loop decoder, sequence generation is conditioned directly on the geometric displacement vector (the difference between $concept_{t}$ and $concept_{t-1}$), removing the need for massive contrastive alignment matrices.
+* **FC-RL Foresight Success Estimator (arXiv:2606.27483):** An internal Q-value estimator that evaluates the generated continuous latent rollout, predicting the structural correctness of the reasoning trace *before* token decoding occurs.
+
 ---
 
 ## IV. Dual-Objective Loss Optimization

@@ -65,6 +65,7 @@ class GRPOLearningEngine:
         group_tokens = []
         group_log_probs = []
         group_rewards = []
+        group_rollout_steps = [] # --- NEW: Track the detached routing choices
         
         # 1. Collect Group Generations asynchronously or sequentially
         for _ in range(group_size):
@@ -93,6 +94,9 @@ class GRPOLearningEngine:
                 group_tokens.append(gen_ids[:, 1:])
                 group_log_probs.append(torch.cat(log_probs_sampled))
                 group_rewards.append(reward)
+                
+                # --- NEW: Save the detached rollout steps for the Router's PPO ratio
+                group_rollout_steps.append(global_steps)
 
         # 2. Compute Group Mean and Standard Deviation to derive Advantage Vectors
         rewards_tensor = torch.tensor(group_rewards, dtype=torch.float32, device=device)
@@ -109,14 +113,20 @@ class GRPOLearningEngine:
         total_loss = 0.0
         for idx in range(group_size):
             # Re-evaluate log probabilities with active gradients
-            student_concept, _, _ = self.model(prompt_tokens)
+            student_concept, current_global_steps, _ = self.model(prompt_tokens)
             
-            # --- NEW: Foresight-Conditioned Calibration (arXiv:2606.27483) ---
-            # The agent predicts its success probability directly from its latent state rollout
+            # --- NEW: DAPPO Router Policy Optimization (arXiv:2606.30616) ---
+            # Treat the continuous routing steps as a secondary RL action space
+            route_ratio = current_global_steps / (group_rollout_steps[idx] + 1e-8)
+            
+            # Apply PPO clipping specifically to the MambaGraphRouter's computation budget
+            route_surr1 = route_ratio * advantages[idx]
+            route_surr2 = torch.clamp(route_ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages[idx]
+            l_route_policy = -torch.min(route_surr1, route_surr2).mean()
+
+            # --- EXISTING: Foresight-Conditioned Calibration ---
             predicted_success = self.model.foresight_head(student_concept).squeeze(-1)
             actual_success = torch.tensor([group_rewards[idx]], dtype=torch.float32, device=device)
-            
-            # Penalize the world model if it cannot accurately predict compiler outcomes
             l_foresight = F.mse_loss(predicted_success, actual_success).mean()
             
             logits = self.decoder(group_tokens[idx], student_concept)
@@ -124,16 +134,13 @@ class GRPOLearningEngine:
             log_probs_current = F.log_softmax(logits, dim=-1)
             target_log_probs = log_probs_current.gather(-1, group_tokens[idx].unsqueeze(-1)).squeeze(-1)
             
-            # Calculate importance sampling ratio
+            # --- EXISTING: Text Generation Policy Optimization ---
             ratio = torch.exp(target_log_probs - group_log_probs[idx])
-            
-            # Compute PPO clipped surrogate objective scaled by Group Advantage
             surr1 = ratio * advantages[idx]
             surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages[idx]
-            
             loss = -torch.min(surr1, surr2).mean()
             
-            # --- NEW: Combine Policy Loss with Foresight Grounding ---
-            total_loss += loss + (0.5 * l_foresight)
+            # --- NEW: Combine Text Policy, Router Policy, and Foresight Grounding ---
+            total_loss += loss + l_route_policy + (0.5 * l_foresight)
 
         return total_loss

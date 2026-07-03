@@ -2,7 +2,7 @@
 
 This document details the training methodology for the 8B JEPA World Model. Because the architecture abandons standard transformer attention in favor of a Mamba2 backbone with dynamic routing and a Joint-Embedding Predictive Architecture (JEPA) head, standard Hugging Face `Trainer` loops are insufficient.
 
-The training pipeline (`train_jepa_world_model.py`) is a custom PyTorch XPU implementation designed to solve two specific problems:
+The training pipeline is decoupled into a multi-stage PyTorch XPU implementation (`train_latent_loop.py`, `train_decoder.py`, and `GRPOLearningEngine.py`) designed to solve two specific problems:
 
 1. Processing "infinite" context reasoning traces without exceeding 32GB VRAM.
 2. Preventing "latent collapse" when balancing generative text prediction with conceptual alignment.
@@ -40,7 +40,7 @@ $$\mathcal{L}_{total} = \mathcal{L}_{CE} + \lambda_{JEPA}(t) \mathcal{L}_{JEPA} 
 
 * **Function:** Cosine Embedding Loss (`F.cosine_embedding_loss`).
 * **Target:** The 1024-d `target_concept` generated offline by BGE-Large.
-* **Purpose:** Forces the model's internal representation (the average-pooled output of the routers) to geometrically align with the true mathematical meaning of the target response, rather than just memorizing tokens.
+* **Purpose:** Forces the model's internal representation (the average-pooled output of the routers) to geometrically align with the true mathematical meaning of the target response. Under the new **Delta-JEPA** paradigm, heavy contrastive matrices were removed; instead, the Closed-Loop Decoder reconstructs code structures directly from the geometric displacement of thought vectors.
 
 ### C. Router Load Balancing ($\mathcal{L}_{Route}$)
 
@@ -62,7 +62,16 @@ To fix this, $\lambda_{JEPA}$ is tied to a **Dynamic Exponential Scheduler**:
 
 ---
 
-## 💻 4. XPU Hardware Implementation Rules
+## 🔄 4. Decoupled Decoder and GRPO Execution
+
+Following the training of the latent core:
+
+1. **Closed-Loop Latent Decoder (`train_decoder.py`):** Trains the specialized decoder mapping the continuous continuous concepts back to discrete tokens, conditioned on the Delta-JEPA structural displacements.
+2. **GRPO Fine-Tuning (`GRPOLearningEngine.py`):** Replaces standard PPO RLHF by evaluating generated code via a deterministic compiler execution. A DAPPO policy explicitly penalizes excessive Mamba routing loops to optimize inference efficiency without relying on a subjective neural Critic network.
+
+---
+
+## 💻 5. XPU Hardware Implementation Rules
 
 To successfully compile and run this 8B architecture on the Intel Arc Pro B70, the training script enforces strict hardware flags:
 

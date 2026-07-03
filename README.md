@@ -11,8 +11,9 @@ Instead of generating synthetic data locally, this pipeline operates via a high-
 ### 1. The 8B Student Model
 
 * **Backbone:** Mamba2 State Space Model (SSM) for linear-time sequence processing.
-* **Routing:** Dynamic Layer Looping Routers, allowing the model to dynamically allocate compute depth based on token complexity.
+* **Routing:** Dynamic Layer Looping Routers, allowing the model to dynamically allocate compute depth based on token complexity. Includes **Token-Level Active Masking (MoR)** for gating computation updates and **Spectral Injection Constraints** to guarantee spectral radius stability.
 * **Alignment Head:** A JEPA projector that maps the pooled router states to a 1024-dimensional continuous latent space, trained via Cosine Embedding loss against offline BGE-Large concept vectors.
+* **Decoder:** A `ClosedLoopLatentDecoder` implementing **Delta-JEPA Latent Difference Decoding** and an **FC-RL Foresight Success Estimator** for world model Q-value estimations.
 
 ### 2. Hardware Optimization (Intel XPU)
 
@@ -49,20 +50,27 @@ Saves chunked `.pt` shards containing dictionaries of variable-length 1D tensors
 
 ```
 
-### Phase 2: Hybrid Training (`train_jepa_world_model.py`)
+### Phase 2: Hybrid Training (`train_latent_loop.py` & `train_decoder.py`)
 
-Trains the 8B student from scratch using a specialized objective to handle "infinite" reasoning traces.
+Trains the 8B student from scratch using a specialized objective to handle "infinite" reasoning traces, broken into a two-stage process.
 
 **Core Mechanisms:**
 
 1. **Truncated BPTT (Chunked State-Passing):** Ingests massive traces (up to 64k+ tokens) by chunking sequences to 4096 tokens. The Mamba2 hidden state ($h_t$) is detached and passed across chunk boundaries, providing infinite context capacity without VRAM explosions.
-2. **Tri-Partite Loss Function:**
+2. **Tri-Partite Loss Function (`train_latent_loop.py`):**
 * $\mathcal{L}_{CE}$: Next-token Cross-Entropy loss on the sequence.
 * $\mathcal{L}_{JEPA}$: Cosine Embedding loss forcing the internal latent representation to match the BGE `target_concept`.
 * $\mathcal{L}_{Route}$: A Z-loss penalty to prevent the dynamic looping routers from collapsing or exceeding maximum loop thresholds.
+3. **Delta-JEPA Latent Difference Decoding (`train_decoder.py`):** Reconstructs the code structure from the geometric displacement of thoughts rather than heavy contrastive matrices.
 
+### Phase 3: GRPO & RLVR Fine-Tuning (`GRPOLearningEngine.py`)
 
-3. **Dynamic Loss Scheduling:** The JEPA loss weight ($\lambda_{JEPA}$) scales exponentially during warmup to anchor the Mamba2 states before allowing full next-token generative optimization.
+A Group Relative Policy Optimization (GRPO) loop combined with Reinforcement Learning from Verifiable Rewards (RLVR). 
+
+**Capabilities:**
+* Evaluates generated outputs via a deterministic compilation/execution check (e.g., `rustc`).
+* Uses a DAPPO Router Policy Optimization that penalizes excessive computational loops, driving efficiency.
+* Avoids memory-heavy Critic neural networks, utilizing pure verifiable performance metrics.
 
 ---
 
@@ -104,9 +112,16 @@ python extract_frontier_data.py
 
 ### 2. Train the JEPA World Model
 
-Execute the training loop. Ensure your `.pt` data shards are available in the target directory.
+Execute the training loop for the latent core. Ensure your `.pt` data shards are available in the target directory.
 
 ```bash
-python train_jepa_world_model.py
+python src/train_latent_loop.py
+```
 
+### 3. Train the Decoder
+
+Train the Closed-Loop Latent Decoder on the extracted concepts.
+
+```bash
+python src/train_decoder.py
 ```

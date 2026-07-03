@@ -20,6 +20,8 @@ Unlike `llama.cpp`, which is bottlenecked by the quadratic memory scaling of Key
 This controls the recurrent execution flow through the 32 physical blocks:
 
 * Rather than running a traditional sequential layer pipeline, it evaluates the dynamic routing probabilities at each block boundary.
+* Employs **Fixed-Point Halting** by tracking the $L_2$ convergence distance ($h_{delta}$) to early-exit tokens whose reasoning logic has stabilized.
+* Enforces **Spectral Injection Constraints** dynamically at runtime to ensure the spectral radius remains strictly negative, maintaining numerical stability in indefinite loops.
 * Maintains a core `RuntimeState` tensor mapping the 6144-dimensional hidden sequence space.
 * Dispatches execution via an explicit jump matrix implemented via a low-level C++ execution table, routing states to block $N+1$, looping back to block $N-k$, or cleanly executing an exit condition to the output projection layer once context evaluation scales out.
 

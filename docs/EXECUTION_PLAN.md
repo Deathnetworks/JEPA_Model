@@ -10,8 +10,8 @@
                                                             ▼
 ┌──────────────────────────────────┐      ┌──────────────────────────────────┐
 │   Phase 4: LRE Native Runtime    │ ◄─── │    Phase 3: Hybrid Training      │
-│   - Port Tokenizer & Execution   │      │  - Chunked State-Passing TBPTT   │
-│   - Native SYCL/XPU Inference    │      │  - Tri-Partite Loss Dynamics     │
+│   - Port Tokenizer & Execution   │      │  - Latent Loop & Decoder         │
+│   - Native SYCL/XPU Inference    │      │  - Tri-Partite Loss & GRPO       │
 └──────────────────────────────────┘      └──────────────────────────────────┘
 
 ```
@@ -41,18 +41,26 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 ---
 
-## Phase 3: The Hybrid Training Loop (`train_jepa_world_model.py`)
+## Phase 3: The Hybrid Training Loop (`train_latent_loop.py` & `train_decoder.py`)
 
 1. **Chunked State-Passing (TBPTT Execution):** Establish an unpadded streaming dataloader that segments incoming long-context sequences into deterministic `4096`-token processing chunks.
 2. **State Decoupling Routine:** Pass the internal recurrent Mamba2 states across sequential block processing operations. Prior to compiling gradients for Chunk $N+1$, invoke `h = h.detach()` to cap autograd memory overhead at a flat $O(1)$ window relative to total sequence length.
-3. **Tri-Partite Loss Evaluation:** Calculate the exact combined update pressure at every gradient step:
+3. **Tri-Partite Loss Evaluation (`train_latent_loop.py`):** Calculate the exact combined update pressure at every gradient step:
 * **$\mathcal{L}_{CE}$:** Cross-Entropy prediction errors mapped over the `qwen_tokens`.
 * **$\mathcal{L}_{JEPA}$:** `F.cosine_embedding_loss` tracking the distance between the projection head and the continuous `target_concept`.
 * **$\mathcal{L}_{Route}$:** A Router Z-loss penalty enforcing uniform load balancing across the ALGR block up to a strict maximum loop ceiling ($\text{max\_loops} = 4$).
 
-
 4. **Dynamic Loss Weight Modulation:** Implement an exponential scaling schedule for the alignment factor $\lambda_{JEPA}(t)$, starting at `0.01` and scaling linearly to `1.0` during the first 10% of global optimization steps to protect the core networks from structural latent space collapse.
-5. **Gradient Accumulation Loop:** Map a single sequence chunk to device memory at any isolated point, accumulating gradient updates across 16 steps before executing the optimizer step.
+5. **Closed-Loop Decoder Training (`train_decoder.py`):** Following the primary loop, train the `ClosedLoopLatentDecoder` to reconstruct text using Delta-JEPA structural displacements.
+6. **Gradient Accumulation Loop:** Map a single sequence chunk to device memory at any isolated point, accumulating gradient updates across 16 steps before executing the optimizer step.
+
+---
+
+## Phase 3.5: GRPO RLVR Fine-Tuning (`GRPOLearningEngine.py`)
+
+1. **Deterministic Evaluation Check:** Execute a compiler evaluation (e.g., `rustc`) over generated code output directly from the Mamba core and decoder.
+2. **Relative Advantage:** Calculate Group Relative Policy Optimization over the returned score to determine optimal routing and execution.
+3. **DAPPO Router Penalty:** Apply sparsity constraints back to the layer router explicitly penalizing unnecessary loops for fast, cheap computation limits.
 
 ---
 
