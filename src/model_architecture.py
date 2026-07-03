@@ -105,9 +105,16 @@ class Mamba2LatentLoop8B(nn.Module):
         self.embedding_global = nn.Embedding(max_budget + 1, d_model)
         self.embedding_block = nn.Embedding(num_blocks + 1, d_model)
 
-        # --- NEW: Spectral Injection Constraints (Parcae - arXiv:2604.12946) ---
-        # Learned continuous parameterization to guarantee spectral radius < 1
+        # --- EXISTING: Spectral Injection Constraints ---
         self.A_log_spectral = nn.Parameter(torch.randn(d_model))
+        
+        # --- NEW: DiscoLoop Discrete Channel (arXiv:2607.00341) ---
+        # Soft Vector Quantization bottleneck to prevent continuous state drift during multi-hop reasoning
+        self.num_discrete_concepts = 4096
+        self.discrete_bottleneck = nn.Linear(d_model, self.num_discrete_concepts)
+        self.discrete_embeddings = nn.Embedding(self.num_discrete_concepts, d_model)
+        # Initialize embeddings to small random values to prevent early disruption
+        nn.init.normal_(self.discrete_embeddings.weight, std=0.02)
 
         self.blocks = nn.ModuleList([Mamba2SSDBlock(d_model=d_model) for _ in range(num_blocks)])
         self.routers = nn.ModuleList([MambaGraphRouter(d_model=d_model, num_blocks=num_blocks) for _ in range(num_blocks)])
@@ -132,36 +139,38 @@ class Mamba2LatentLoop8B(nn.Module):
         current_block_idx = 0
         new_mamba_state = [None] * self.num_blocks
         
-        # NEW: Track previous state for Fixed-Point Halting (arXiv:2604.11791)
         prev_hidden_state = hidden_state.clone()
 
         while (global_steps < active_budget).any() and current_block_idx < self.num_blocks:
-            # --- NEW: Token-Level Active Masking (MoR - arXiv:2507.10524) ---
-            # Create a physical mask of tokens that are still actively "thinking"
             active_mask = (unhalted_prob > 0.05).float()
             
             step_env = self.embedding_global(global_steps.squeeze(-1).long())
             block_env = self.embedding_block(torch.full_like(global_steps, current_block_idx).squeeze(-1).long())
 
-            # --- NEW: Spectral Injection Constraints (Parcae - arXiv:2604.12946) ---
-            # A_discrete = exp(dt * A_continuous) where A_continuous is forced strictly negative
             A_discrete = torch.exp(-torch.exp(self.A_log_spectral) * 1.0)
-            
-            # Apply stable spectral decay to the residual stream before additive temporal injection
             hidden_state = (hidden_state * A_discrete) + step_env + block_env
 
             block_out, new_mamba_state[current_block_idx] = self.blocks[current_block_idx](
                 hidden_state, mamba_state_list[current_block_idx]
             )
             
-            # Apply Token-Level Active Mask to physically gate computation updates
-            hidden_state = (block_out * active_mask) + hidden_state
+            # --- NEW: DiscoLoop Discrete Realignment (arXiv:2607.00341) ---
+            # 1. Project the continuous block output to the discrete concept space
+            discrete_logits = self.discrete_bottleneck(block_out)
+            # 2. Extract soft probabilities (maintains backprop differentiability)
+            soft_discrete_idx = F.softmax(discrete_logits, dim=-1)
+            # 3. Retrieve the discrete embeddings via matrix multiplication
+            discrete_channel = torch.matmul(soft_discrete_idx, self.discrete_embeddings.weight)
+            
+            # Combine the continuous state with the explicitly grounded discrete channel
+            block_out_aligned = block_out + discrete_channel
 
-            # --- NEW: Calculate L2 convergence distance for Fixed-Point Halting ---
+            # Apply Token-Level Active Mask using the explicitly aligned output
+            hidden_state = (block_out_aligned * active_mask) + hidden_state
+
             h_delta = torch.norm(hidden_state - prev_hidden_state, dim=-1, keepdim=True)
             prev_hidden_state = hidden_state.clone()
 
-            # Pass the convergence signal h_delta to the router
             route_probs = self.routers[current_block_idx](hidden_state, h_delta, global_steps, self.max_budget)
             
             halt_prob = route_probs[:, :, -2].unsqueeze(-1)
@@ -169,7 +178,7 @@ class Mamba2LatentLoop8B(nn.Module):
             expected_steps = expected_steps + (global_steps + 1) * step_halt_prob
             unhalted_prob = unhalted_prob * (1.0 - halt_prob)
 
-            global_steps += active_mask # Only increment budget for tokens still computing
+            global_steps += active_mask
             current_block_idx += 1
             
         expected_steps = expected_steps + global_steps * unhalted_prob
