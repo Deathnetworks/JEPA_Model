@@ -197,31 +197,59 @@ class Mamba2LatentLoop8B(nn.Module):
 
         return hidden_state, expected_steps, mamba_state_out
 
-class LatentProjectionHead(nn.Module):
-    def __init__(self, d_model=6144, d_latent=1024):
+class HierarchicalLatentProjectionHead(nn.Module):
+    """
+    Dynamic Hierarchical Concept Expansion (Mitigates Latent Saturation).
+    """
+    def __init__(self, d_model=6144, d_micro=1024, d_macro=4096):
         super().__init__()
-        self.proj = nn.Linear(d_model, d_latent)
+        self.d_micro = d_micro
+        self.d_macro = d_macro
+        
+        # Base Space: Always active, anchors syntax and local logic
+        self.micro_proj = nn.Linear(d_model, d_micro)
+        
+        # Expansion Space: High-dimensional geometry for macro-architecture mapping
+        self.macro_proj = nn.Linear(d_model, d_macro)
+        
+        # Differentiable sparsity gate to evaluate state complexity
+        self.expansion_gate = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.SiLU(),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
         pooled = x.mean(dim=1)
-        return self.proj(pooled)
+        
+        micro_concept = self.micro_proj(pooled)
+        
+        # Calculate dynamic routing confidence for macro expansion
+        gate_scores = self.expansion_gate(pooled)
+        
+        # Sparsely activate the macro space. If gate approaches 0, macro space zeroes out.
+        macro_concept = self.macro_proj(pooled) * gate_scores
+        
+        # Concatenate into a combined 5120D hierarchical latent tensor
+        return torch.cat([micro_concept, macro_concept], dim=-1)
 
 class MambaJEPAEngine(nn.Module):
-    def __init__(self, vocab_size=151643, d_model=6144, num_blocks=32, max_budget=64, d_latent=1024):
+    # Notice d_latent defaults to 1024 (Micro) + 4096 (Macro) = 5120
+    def __init__(self, vocab_size=151643, d_model=6144, num_blocks=32, max_budget=64, d_latent=5120):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.mamba_loop = Mamba2LatentLoop8B(d_model=d_model, num_blocks=num_blocks, max_budget=max_budget)
-        self.projection_head = LatentProjectionHead(d_model=d_model, d_latent=d_latent)
         
-        # --- NEW: FC-RL Foresight Success Estimator (arXiv:2606.27483) ---
-        # Acts as an internal world model Q-value estimator directly on the latent rollout
+        # --- NEW: Hierarchical Expansion ---
+        self.projection_head = HierarchicalLatentProjectionHead(d_model=d_model, d_micro=1024, d_macro=4096)
+        
         self.foresight_head = nn.Sequential(
             nn.Linear(d_latent, 256),
             nn.SiLU(),
             nn.Linear(256, 1),
             nn.Sigmoid()
         )
-        
         self.max_budget = max_budget
 
     def forward(self, input_tokens, mamba_state=None, active_budget=None):
@@ -251,7 +279,8 @@ class ClosedLoopLatentDecoder(nn.Module):
     Upgraded Decoder mapping to EWM principles.
     Treats the latent concept vector as an examineable canvas conditioned via cross-attention.
     """
-    def __init__(self, d_latent=1024, max_seq_len=256, d_model=6144, vocab_size=151643):
+    # CRITICAL: Default d_latent updated to 5120 to ingest the hierarchical space
+    def __init__(self, d_latent=5120, max_seq_len=256, d_model=6144, vocab_size=151643):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.d_model = d_model

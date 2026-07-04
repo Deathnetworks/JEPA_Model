@@ -41,10 +41,10 @@ class TripartiteLoss(nn.Module):
         l_ce = self.ce_loss(logits_flat, qwen_tokens_flat)
 
         # 2. JEPA Alignment Loss (Positive Pairs)
-        l_jepa_align = 1 - F.cosine_similarity(student_concept, target_concept, dim=-1).mean()
-        
-        # --- DELTA-JEPA UPGRADE: Heavy Contrastive Matrices Removed ---
-        # Latent difference decoding inherently prevents dimensional collapse, saving massive VRAM.
+        # --- NEW: Hierarchical Sliced Alignment ---
+        # Anchor only the foundational 1024D syntax space to the static BGE-M3 vectors
+        student_micro = student_concept[:, :1024]
+        l_jepa_align = 1 - F.cosine_similarity(student_micro, target_concept, dim=-1).mean()
         l_jepa = l_jepa_align
 
         # 3. Routing Penalty Loss (Compute Budget)
@@ -54,7 +54,11 @@ class TripartiteLoss(nn.Module):
         else:
             l_route = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
 
-        # Encourages the final latent thought to settle into a low-energy, resolved state
+        # --- EXISTING ELEGANCE: Native Sparsity Gating ---
+        # Because we concatenated the gated Macro space onto the student_concept tensor, 
+        # this L2 Energy Contraction inherently acts as a Sparsity Penalty. 
+        # The model is forced to keep the Macro gate at 0.0 to save energy UNLESS 
+        # the Cross-Entropy loss strictly demands macro-architectural resolution!
         l_energy_contraction = torch.norm(student_concept, p=2, dim=-1).mean() * 0.001
 
         total_loss = l_ce + (lambda_jepa * l_jepa) + (self.lambda_route * l_route) + l_energy_contraction
