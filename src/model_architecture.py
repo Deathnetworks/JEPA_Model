@@ -31,17 +31,17 @@ class MambaGraphRouter(nn.Module):
 class Mamba2SSDBlock(nn.Module):
     """
     Simulated State Space Duality (SSD) Layer.
-    Optimized to map down to Intel XMX hardware matrix lanes.
+    Tuned for ~19.5GB BF16 Training / 9.7GB INT8 Inference.
     """
-    def __init__(self, d_model=6144, d_state=128, nheads=96):
+    def __init__(self, d_model=6144, d_state=256, nheads=128):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.nheads = nheads
-        self.d_head = 128
-        self.d_inner = nheads * self.d_head # 12288
+        
+        self.d_head = 64 
+        self.d_inner = nheads * self.d_head # 8192
 
-        # Single fused projection layout to eliminate kernel dispatch bottlenecks
         self.in_proj = nn.Linear(d_model, 2 * self.d_inner + 2 * d_state + self.nheads)
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner, out_channels=self.d_inner,
@@ -206,32 +206,26 @@ class HierarchicalLatentProjectionHead(nn.Module):
         self.d_micro = d_micro
         self.d_macro = d_macro
         
-        # Base Space: Always active, anchors syntax and local logic
         self.micro_proj = nn.Linear(d_model, d_micro)
-        
-        # Expansion Space: High-dimensional geometry for macro-architecture mapping
         self.macro_proj = nn.Linear(d_model, d_macro)
         
-        # Differentiable sparsity gate to evaluate state complexity
+        # UPGRADE: Removed Sigmoid from Sequential to apply Temperature Scaling manually
         self.expansion_gate = nn.Sequential(
             nn.Linear(d_model, 128),
             nn.SiLU(),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
+            nn.Linear(128, 1)
         )
 
     def forward(self, x):
         pooled = x.mean(dim=1)
-        
         micro_concept = self.micro_proj(pooled)
         
-        # Calculate dynamic routing confidence for macro expansion
-        gate_scores = self.expansion_gate(pooled)
+        # UPGRADE: Temperature Scaled Sigmoid (T=0.1) for a strict On/Off boundary
+        gate_logits = self.expansion_gate(pooled)
+        gate_scores = torch.sigmoid(gate_logits / 0.1) 
         
-        # Sparsely activate the macro space. If gate approaches 0, macro space zeroes out.
         macro_concept = self.macro_proj(pooled) * gate_scores
         
-        # Concatenate into a combined 5120D hierarchical latent tensor
         return torch.cat([micro_concept, macro_concept], dim=-1)
 
 class MambaJEPAEngine(nn.Module):

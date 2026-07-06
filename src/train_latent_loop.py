@@ -4,7 +4,8 @@ import time
 import math
 import logging
 import argparse
-from accelerate import Accelerator
+from accelerate import Accelerator, DeepSpeedPlugin
+import torch.optim as optim
 from pathlib import Path
 
 import torch
@@ -59,7 +60,9 @@ class TripartiteLoss(nn.Module):
         # this L2 Energy Contraction inherently acts as a Sparsity Penalty. 
         # The model is forced to keep the Macro gate at 0.0 to save energy UNLESS 
         # the Cross-Entropy loss strictly demands macro-architectural resolution!
-        l_energy_contraction = torch.norm(student_concept, p=2, dim=-1).mean() * 0.001
+        # Penalizing the micro-space destroys the BGE-M3 baseline knowledge.
+        macro_concept = student_concept[:, 1024:]
+        l_energy_contraction = torch.norm(macro_concept, p=2, dim=-1).mean() * 0.001
 
         total_loss = l_ce + (lambda_jepa * l_jepa) + (self.lambda_route * l_route) + l_energy_contraction
         return total_loss, l_ce, l_jepa, l_route
@@ -128,7 +131,19 @@ def train_loop(
     data_dir=r"F:\JEPA_Model\data\shards",
     curriculum_phase="frontier_traces"
 ):
-    accelerator = Accelerator(gradient_accumulation_steps=16)
+    # --- NEW: DeepSpeed ZeRO-2 CPU Offload ---
+    deepspeed_plugin = DeepSpeedPlugin(
+        zero_stage=2,
+        offload_optimizer_device="cpu",
+        offload_param_device="none", # Keep weights on XPU for maximum compute speed
+        gradient_accumulation_steps=16,
+        gradient_clipping=1.0
+    )
+    
+    accelerator = Accelerator(
+        gradient_accumulation_steps=16, 
+        deepspeed_plugin=deepspeed_plugin
+    )
     device = accelerator.device
 
     if device.type == 'cpu':
@@ -173,7 +188,9 @@ def train_loop(
         {"params": [p for n, p in decoder.named_parameters() if p.requires_grad]}
     ]
 
-    optimizer = bnb.optim.AdamW8bit(
+    # --- UPGRADE: Replace 8-bit Adam with standard AdamW ---
+    # Because ZeRO-2 offloads this to System RAM, we no longer need VRAM quantization here.
+    optimizer = optim.AdamW(
         optimizer_grouped_parameters,
         lr=learning_rate,
         betas=(0.9, 0.95),

@@ -8,7 +8,8 @@ import torch.nn as nn
 from datasets import load_dataset
 from transformers import AutoTokenizer
 import bitsandbytes as bnb
-from accelerate import Accelerator
+from accelerate import Accelerator, DeepSpeedPlugin
+import torch.optim as optim
 
 try:
     import intel_extension_for_pytorch as ipex
@@ -20,17 +21,30 @@ from src.GRPOLearningEngine import GRPOLearningEngine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def setup_device():
+def setup_accelerator():
     """
-    Ensure the target device is the Intel Arc Pro B70 GPU (xpu) if available.
+    Initializes the Hugging Face Accelerator with DeepSpeed ZeRO-2 
+    to offload optimizer states to system RAM.
     """
-    if torch.xpu.is_available():
-        device = torch.device("xpu")
-        logging.info(f"Targeting native Intel GPU compute via device: {device}")
+    deepspeed_plugin = DeepSpeedPlugin(
+        zero_stage=2,
+        offload_optimizer_device="cpu",
+        offload_param_device="none", # Keep weights on XPU for maximum compute speed
+        gradient_accumulation_steps=16,
+        gradient_clipping=1.0
+    )
+    
+    accelerator = Accelerator(
+        gradient_accumulation_steps=16, 
+        deepspeed_plugin=deepspeed_plugin
+    )
+    
+    if accelerator.device.type == "xpu":
+        logging.info(f"Targeting native Intel GPU compute via device: {accelerator.device}")
     else:
-        device = torch.device("cpu")
         logging.warning("XPU not available, falling back to CPU. Performance will be degraded.")
-    return device
+        
+    return accelerator
 
 def stream_rl_prompts(dataset_name="ise-uiuc/Magicoder-OSS-Instruct-75K", start_idx=0):
     """
@@ -50,8 +64,9 @@ def train_rl_loop(
     decoder_path: str = "latent_decoder.pth",
     tokenizer_name: str = "Qwen/Qwen2.5-7B-Instruct",
 ):
-    accelerator = Accelerator()
-    device = setup_device()
+    # --- FIX: Initialize the accelerator WITH the DeepSpeed plugin ---
+    accelerator = setup_accelerator()
+    device = accelerator.device
 
     logging.info(f"Loading tokenizer {tokenizer_name}...")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
@@ -98,7 +113,9 @@ def train_rl_loop(
         {"params": [p for n, p in decoder.named_parameters() if p.requires_grad]}
     ]
 
-    optimizer = bnb.optim.AdamW8bit(
+    # --- UPGRADE: Replace 8-bit Adam with standard AdamW ---
+    # Because ZeRO-2 offloads this to System RAM, we no longer need VRAM quantization here.
+    optimizer = optim.AdamW(
         optimizer_grouped_parameters,
         lr=learning_rate,
         betas=(0.9, 0.95),
