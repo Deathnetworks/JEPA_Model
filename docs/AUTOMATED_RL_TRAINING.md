@@ -196,3 +196,51 @@ For an AI agent implementing this document as a feature in `src/GRPOLearningEngi
 *   **VRAM Management**: During the GRPO loop, you are running $G$ inferences and then calculating backpropagation. After each inference chunk, explicitly call `torch.xpu.empty_cache()` (or equivalent `cuda` / `mps` call) to flatten the memory curve.
 *   **Dynamic Budgeting bounds**: Ensure the continuous routing steps (the "Compute Budget" in the Mamba Graph Router) are capped. Use a formula like `max_loops = min(64, max(8, num_tokens // 64))` to mathematically bound the execution time during RL sweeps.
 *   **NaN Gradients**: When calculating GRPO Advantages, if all outputs in the group are identical, `std_reward` will be `0`. Always add an epsilon (`1e-6`) to the denominator: `advantages = (rewards - mean) / (std + 1e-6)`.
+
+## 6. Sourcing Curriculum Prompts from Hugging Face Datasets
+
+To run continuous RL, the engine needs a massive supply of high-quality prompts (the "questions") across different languages and difficulty levels. Instead of writing these manually, we can stream standard datasets from the Hugging Face Hub as the foundation for the prompt curriculum.
+
+### Recommended Datasets for Code RL
+
+The following datasets provide excellent problem descriptions that can be fed into the `train_grpo_step(prompt, ...)` loop:
+
+#### A. Multi-Language Benchmarks
+1. **`nuprl/MultiPL-E`**
+   - **Why it’s useful**: This is a multi-lingual translation of the classic HumanEval and MBPP datasets. It provides the exact same programming problems translated into 18+ languages (Rust, Python, JS, C++, etc.).
+   - **How to use it**: Pull the `prompt` field (which usually contains the docstring/instructions) and use the `tests` field to automatically evaluate the generated code.
+2. **`ise-uiuc/Magicoder-OSS-Instruct-75K`**
+   - **Why it’s useful**: Contains highly diverse, synthetic coding instructions generated from open-source snippets. It covers real-world tasks (like "create a one-page HTML calculator" or "write a fast API endpoint").
+   - **How to use it**: Stream the `instruction` column as the raw prompt for the RL engine. The difficulty is generally higher and more diverse than basic algorithmic benchmarks.
+
+#### B. Language-Specific Algorithmic Problems
+1. **`google-research-datasets/mbpp` (Python)**
+   - **Why it’s useful**: Mostly Python, but contains clean, single-sentence requirements (e.g., "Write a function to find the maximum sum of a contiguous subarray.") and the exact programmatic assertions (`assert max_sum([1, -2, 3]) == 3`) needed for automated rewards.
+2. **`deepmind/code_contests` (C++, Python, Java)**
+   - **Why it’s useful**: For advanced logic/creative reasoning. Contains competitive programming problems. Very difficult, ideal for the final stages of the curriculum.
+
+#### C. Integrating HF Streaming into the RL Pipeline
+When pulling these datasets to generate curriculum prompts, **always use streaming** to avoid downloading massive text corpora to the local machine, and utilize native `.skip()` methods to resume training.
+
+**Pseudocode for Curriculum Streaming:**
+
+```python
+from datasets import load_dataset
+
+def stream_rl_prompts(dataset_name="ise-uiuc/Magicoder-OSS-Instruct-75K", start_idx=0):
+    # Stream directly from Hugging Face without local caching
+    dataset = load_dataset(dataset_name, split="train", streaming=True)
+
+    # CRITICAL MEMORY PRACTICE: Use native .skip() rather than looping over the generator
+    # This prevents network bottlenecking.
+    dataset = dataset.skip(start_idx)
+
+    for row in dataset:
+        prompt = row['instruction']
+        yield prompt
+
+# Inside your training loop:
+prompt_generator = stream_rl_prompts(start_idx=current_epoch_step)
+for prompt in prompt_generator:
+    train_grpo_step(prompt, model, optimizer, tokenizer)
+```
