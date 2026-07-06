@@ -100,7 +100,8 @@ DATASET_QUEUE = {
         "Roman1111111/gemini-3.1-pro-hard-high-reasoning",
         "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k",
         "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k-Alpaca-GPT4",
-        "WebNovelTrans/kunpeng-sentencepairs-5m-instruction"
+        "WebNovelTrans/kunpeng-sentencepairs-5m-instruction",
+        "openbmb/UltraData-SFT-2605"
     ],
     "general_knowledge": [
         "HuggingFaceFW/fineweb-edu",
@@ -125,7 +126,10 @@ DATASET_QUEUE = {
         "rajpurkar/squad",
         "google/boolq",
         "AlgorithmicResearchGroup/arxiv_s2orc_parsed",
-        "AlgorithmicResearchGroup/s2orc-cs-enriched"
+        "AlgorithmicResearchGroup/s2orc-cs-enriched",
+        "openbmb/Ultra-FineWeb",
+        "openbmb/Ultra-FineWeb-L3",
+        "openbmb/UltraData-Math"
     ],
     "code_mechanics": [
         "nvidia/Nemotron-Pretraining-Code-v3",
@@ -268,6 +272,38 @@ SPECIAL_LOAD_ARGS = {
     "nvidia/Nemotron-SFT-Multilingual-v2": [
         {"name": "ko", "split": "train"},
         {"name": "ja", "split": "train"}
+    ],
+    "openbmb/Ultra-FineWeb": [
+        {"split": "en"},
+        {"split": "zh"}
+    ],
+    "openbmb/Ultra-FineWeb-L3": [        
+        {"name": "Ultra-FineWeb-L3-en-Multi-Style-Synthetic", "split": "train"},
+        {"name": "Ultra-FineWeb-L3-zh-Multi-Style-Synthetic", "split": "train"},
+        {"name": "Ultra-FineWeb-L3-zh-QA-Synthetic", "split": "train"},
+        {"name": "Ultra-FineWeb-L3-en-QA-Synthetic", "split": "train"}
+    ],
+    "openbmb/UltraData-Math": [        
+        {"name": "UltraData-Math-L1", "split": "train"},
+        {"name": "UltraData-Math-L2-preview", "split": "train"},
+        {"name": "UltraData-Math-L3-Conversation-Synthetic", "split": "train"},
+        {"name": "UltraData-Math-L3-Conversation-Synthetic", "split": "train"},
+        {"name": "UltraData-Math-L3-QA-Synthetic", "split": "train"},
+        {"name": "UltraData-Math-L3-Textbook-Exercise-Synthetic", "split": "train"}
+    ],
+    "openbmb/UltraData-SFT-2605": [        
+        {"name": "Chinese-general", "split": "think"},
+        {"name": "Chinese-general", "split": "no_think"},
+        {"name": "Code", "split": "think"},
+        {"name": "Code", "split": "no_think"},
+        {"name": "IF", "split": "think"},
+        {"name": "IF", "split": "no_think"},
+        {"name": "Knowledge", "split": "think"},
+        {"name": "Knowledge", "split": "no_think"},
+        {"name": "Math", "split": "think"},
+        {"name": "Math", "split": "no_think"},
+        {"name": "Multi-lang-Knowledge", "split": "no_think"},
+        {"name": "Multi-lang-Math", "split": "no_think"}
     ]
 }
 
