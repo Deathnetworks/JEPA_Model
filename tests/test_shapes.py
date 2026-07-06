@@ -16,8 +16,8 @@ def test_engine_tensor_shapes():
     # Initialize a miniature version of the 8B engine for local memory safety
     d_model = 64
     num_blocks = 2
-    model = MambaJEPAEngine(vocab_size=151643, d_model=d_model, num_blocks=num_blocks, max_budget=4, d_latent=1024).to(device)
-    decoder = DualStageLatentDecoder(d_latent=1024, max_seq_len=512, d_model=d_model, vocab_size=151643).to(device)
+    model = MambaJEPAEngine(vocab_size=151643, d_model=d_model, num_blocks=num_blocks, max_budget=4, d_latent=5120).to(device)
+    decoder = DualStageLatentDecoder(d_latent=5120, max_seq_len=512, d_model=d_model, vocab_size=151643).to(device)
 
     model.eval()
     decoder.eval()
@@ -42,7 +42,7 @@ def test_engine_tensor_shapes():
     
     # 2. Check JEPA Projection Vector
     print(f"JEPA Concept Shape: {list(jepa_concept.shape)}")
-    assert jepa_concept.shape == (batch_size, 1024), "❌ JEPA Concept dimension mismatch."
+    assert jepa_concept.shape == (batch_size, 5120), "❌ JEPA Concept dimension mismatch."
 
     # 3. Check Mamba2 Recurrent State Matrix (For TBPTT state-passing)
     # Expected: [Batch, num_blocks, nheads, d_state, d_state]
