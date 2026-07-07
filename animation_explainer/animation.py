@@ -26,8 +26,10 @@ class MambaJEPAExplainer(Scene):
 
         self.play(Create(ar_box), Write(ar_text))
         self.play(Create(mamba_box), Write(mamba_text), GrowArrow(arrow))
+        exp1 = Text("Mamba processes tokens linearly without storing past KV caches, saving massive memory.", font_size=18, color=WHITE).to_edge(DOWN)
+        self.play(Write(exp1))
         self.wait(3)
-        self.play(FadeOut(ar_box), FadeOut(ar_text), FadeOut(mamba_box), FadeOut(mamba_text), FadeOut(arrow), FadeOut(topic1))
+        self.play(FadeOut(ar_box), FadeOut(ar_text), FadeOut(mamba_box), FadeOut(mamba_text), FadeOut(arrow), FadeOut(topic1), FadeOut(exp1))
 
         # 2. Dynamic Layer Looping (Visual)
         topic2 = Text("Dynamic Layer Looping (ALGR)", font_size=40, color=YELLOW).to_edge(UP)
@@ -41,6 +43,8 @@ class MambaJEPAExplainer(Scene):
         token = Circle(radius=0.3, color=YELLOW, fill_opacity=1).shift(LEFT*4)
 
         self.play(Create(layer1), Create(layer2), Write(l1_text), Write(l2_text), FadeIn(token))
+        exp2 = Text("Tokens can dynamically loop through layers for extra compute if they are complex.", font_size=18, color=WHITE).to_edge(DOWN)
+        self.play(Write(exp2))
 
         # Animate token moving through and looping
 
@@ -56,7 +60,7 @@ class MambaJEPAExplainer(Scene):
         self.play(token.animate.move_to(RIGHT*4))
 
         self.wait(2)
-        self.play(FadeOut(VGroup(layer1, layer2, l1_text, l2_text, token, loop_back, loop_text, topic2)))
+        self.play(FadeOut(VGroup(layer1, layer2, l1_text, l2_text, token, loop_back, loop_text, topic2, exp2)))
 
         # 3. Geometric Decoding & Code Gen (Visual)
         topic3 = Text("Geometric Decoding for Code", font_size=40, color=YELLOW).to_edge(UP)
@@ -69,7 +73,7 @@ class MambaJEPAExplainer(Scene):
         vec_text1 = Text("Latent Concept", font_size=20, color=BLUE).next_to(vector_plane.c2p(2,1), DOWN)
         vec_text2 = Text("Delta Difference", font_size=20, color=GREEN).next_to(vector_plane.c2p(1,2.5), UP)
 
-        code_block = Code(code_string="fn main() {\n  println!(\"Hello\");\n}", language="rust", font_size=20, insert_line_no=False).shift(RIGHT*3)
+        code_block = Code(code_string="fn main() {\n  println!(\"Hello\");\n}", language="rust", add_line_numbers=False).scale(0.5).shift(RIGHT*3)
         mapping_arrow = Arrow(vector_plane.c2p(1, 2.5), code_block.get_left(), buff=0.5, color=YELLOW)
         map_text = Text("Decodes to Structure", font_size=20).next_to(mapping_arrow, UP)
 
@@ -77,9 +81,11 @@ class MambaJEPAExplainer(Scene):
         self.play(GrowArrow(concept_vec), Write(vec_text1))
         self.play(GrowArrow(delta_vec), Write(vec_text2))
         self.play(GrowArrow(mapping_arrow), Write(map_text), FadeIn(code_block))
+        exp3 = Text("Instead of next-token search, code structure is generated from vector displacements in latent space.", font_size=18, color=WHITE).to_edge(DOWN)
+        self.play(Write(exp3))
 
         self.wait(3)
-        self.play(FadeOut(VGroup(vector_plane, concept_vec, delta_vec, vec_text1, vec_text2, code_block, mapping_arrow, map_text, topic3)))
+        self.play(FadeOut(VGroup(vector_plane, concept_vec, delta_vec, vec_text1, vec_text2, code_block, mapping_arrow, map_text, topic3, exp3)))
 
         # 4. Truncated BPTT (Visual)
         topic4 = Text("Truncated BPTT: Massive Traces", font_size=40, color=YELLOW).to_edge(UP)
@@ -93,6 +99,8 @@ class MambaJEPAExplainer(Scene):
 
         self.play(Create(trace), Write(trace_text))
         self.play(Create(chunk), Write(chunk_text))
+        exp4 = Text("Massive reasoning traces are chunked. Only the fixed-size hidden state is passed, saving VRAM.", font_size=18, color=WHITE).to_edge(DOWN)
+        self.play(Write(exp4))
 
         for i in range(3):
             self.play(chunk.animate.shift(RIGHT*2), run_time=1)
@@ -101,7 +109,7 @@ class MambaJEPAExplainer(Scene):
             self.play(FadeOut(state_text), run_time=0.5)
 
         self.wait(1)
-        self.play(FadeOut(VGroup(trace, trace_text, chunk, chunk_text, topic4)))
+        self.play(FadeOut(VGroup(trace, trace_text, chunk, chunk_text, topic4, exp4)))
 
         # 5. Benefits, Flaws, and Future
         topic5 = Text("Capabilities, Limits, and Future", font_size=40, color=YELLOW).to_edge(UP)
@@ -169,9 +177,11 @@ class MambaJEPAExplainer(Scene):
         # Highlight JEPA range
         jepa_highlight = Text("Estimated Min/Max", font_size=16, color=YELLOW).next_to(group[-2], UP)
         self.play(Write(jepa_highlight))
+        exp6 = Text("JEPA-8B targets robust hybrid performance, balancing pure reasoning against structural code generation.", font_size=18, color=WHITE).to_edge(DOWN)
+        self.play(Write(exp6))
 
         self.wait(5)
-        self.play(FadeOut(axes), FadeOut(group), FadeOut(legend), FadeOut(topic6), FadeOut(jepa_highlight))
+        self.play(FadeOut(axes), FadeOut(group), FadeOut(legend), FadeOut(topic6), FadeOut(jepa_highlight), FadeOut(exp6))
 
         # Outro
         outro = Text("Thanks for watching!", font_size=48, color=BLUE)
