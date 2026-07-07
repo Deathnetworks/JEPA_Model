@@ -45,10 +45,7 @@ from transformers import AutoTokenizer, AutoModel
 # =====================================================================
 DATASET_QUEUE = {
     "frontier_traces": [
-        "Crownelius/Complete-FABLE.5-traces-2M",
-        "Qwen/AgentWorldBench",
-        "nvidia/HelpSteer2",
-        "nvidia/HelpSteer2-Pref",
+        "agentlans/mlabonne-open-perfectblend",        
         "nvidia/Nemotron-Math-Proofs-v2",
         "nvidia/Nemotron-RL-InverseIFEval-v1",
         "nvidia/Nemotron-RL-CFBench-v1",
@@ -101,7 +98,12 @@ DATASET_QUEUE = {
         "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k",
         "FradSer/DeepSeek-R1-Distilled-Translate-en-zh_CN-39k-Alpaca-GPT4",
         "WebNovelTrans/kunpeng-sentencepairs-5m-instruction",
-        "openbmb/UltraData-SFT-2605"
+        "openbmb/UltraData-SFT-2605",
+        "mlabonne/open-perfectblend",
+        "Crownelius/Complete-FABLE.5-traces-2M",
+        "Qwen/AgentWorldBench",
+        "nvidia/HelpSteer2",
+        "nvidia/HelpSteer2-Pref"
     ],
     "general_knowledge": [
         "HuggingFaceFW/fineweb-edu",
