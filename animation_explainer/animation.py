@@ -4,127 +4,173 @@ class MambaJEPAExplainer(Scene):
     def construct(self):
         # Intro
         title = Text("Mamba2-Latent-Loop-8B Engine", font_size=48, color=BLUE)
-        subtitle = Text("A Beginner's Guide to Hybrid Reasoning", font_size=32)
+        subtitle = Text("Hybrid Reasoning Capabilities", font_size=32)
         VGroup(title, subtitle).arrange(DOWN).move_to(ORIGIN)
         self.play(Write(title), FadeIn(subtitle))
         self.wait(2)
         self.play(FadeOut(title), FadeOut(subtitle))
 
-        # 1. How the model works & Contrast against standard AR transformers
-        topic1 = Text("1. How It Works vs. Standard Transformers", font_size=40, color=YELLOW).to_edge(UP)
+        # 1. Standard AR vs Mamba2 Hybrid (Visual)
+        topic1 = Text("Standard AR vs Mamba2 Hybrid", font_size=40, color=YELLOW).to_edge(UP)
         self.play(Write(topic1))
 
-        ar_text = Text("Standard AR Transformers:\n- Predict next token\n- High memory usage\n- Struggles with infinite context", font_size=24)
-        mamba_text = Text("Mamba2-JEPA Hybrid:\n- Mamba-2 State Space Duality\n- Non-autoregressive latent prediction\n- Linear-time context scaling", font_size=24)
-        VGroup(ar_text, mamba_text).arrange(RIGHT, buff=1)
+        # Visuals for AR
+        ar_box = Rectangle(width=3, height=2, color=RED, fill_opacity=0.2).shift(LEFT*3)
+        ar_text = Text("Standard AR\nO(N^2) Memory\nNext-Token Focus", font_size=20).move_to(ar_box.get_center())
 
-        self.play(FadeIn(ar_text))
-        self.wait(2)
-        self.play(FadeIn(mamba_text))
+        # Visuals for Mamba
+        mamba_box = Rectangle(width=3, height=2, color=GREEN, fill_opacity=0.2).shift(RIGHT*3)
+        mamba_text = Text("Mamba2 Hybrid\nLinear Scaling\nLatent Prediction", font_size=20).move_to(mamba_box.get_center())
+
+        arrow = DoubleArrow(ar_box.get_right(), mamba_box.get_left(), buff=0.5)
+
+        self.play(Create(ar_box), Write(ar_text))
+        self.play(Create(mamba_box), Write(mamba_text), GrowArrow(arrow))
         self.wait(3)
-        self.play(FadeOut(ar_text), FadeOut(mamba_text), FadeOut(topic1))
+        self.play(FadeOut(ar_box), FadeOut(ar_text), FadeOut(mamba_box), FadeOut(mamba_text), FadeOut(arrow), FadeOut(topic1))
 
-        # 2. How to use & Intel Arc Pro Optimization
-        topic2 = Text("2. How to Use & Intel Hardware Optimization", font_size=40, color=YELLOW).to_edge(UP)
+        # 2. Dynamic Layer Looping (Visual)
+        topic2 = Text("Dynamic Layer Looping (ALGR)", font_size=40, color=YELLOW).to_edge(UP)
         self.play(Write(topic2))
 
-        usage_code = Code(
-            code="""# Run end-to-end pipeline
-./run_pipeline.ps1
+        layer1 = Rectangle(width=1.5, height=3, color=BLUE).shift(LEFT*2)
+        layer2 = Rectangle(width=1.5, height=3, color=BLUE).shift(RIGHT*2)
+        l1_text = Text("Layer 1", font_size=20).move_to(layer1)
+        l2_text = Text("Layer 2", font_size=20).move_to(layer2)
 
-# Native Intel GPU Compute (XPU)
-torch.autocast(device_type='xpu', dtype=torch.bfloat16)""",
-            language="powershell",
-            font_size=24,
-            insert_line_no=False,
-            style="monokai"
-        )
-        hardware_text = Text("Optimized for Intel Arc Pro:\n- Native PyTorch XPU support\n- 8-bit AdamW optimizer\n- No need for IPEX", font_size=24).next_to(usage_code, DOWN, buff=0.5)
+        token = Circle(radius=0.3, color=YELLOW, fill_opacity=1).shift(LEFT*4)
 
-        self.play(FadeIn(usage_code))
-        self.play(FadeIn(hardware_text))
-        self.wait(3)
-        self.play(FadeOut(usage_code), FadeOut(hardware_text), FadeOut(topic2))
+        self.play(Create(layer1), Create(layer2), Write(l1_text), Write(l2_text), FadeIn(token))
 
-        # 3. Dynamic Layer Looping Routers (ALGR)
-        topic3 = Text("3. Dynamic Layer Looping Routers (ALGR)", font_size=40, color=YELLOW).to_edge(UP)
+        # Animate token moving through and looping
+
+
+        loop_back = CurvedArrow(layer2.get_top(), layer1.get_top(), angle=TAU/4, color=RED)
+
+        self.play(token.animate.move_to(layer1.get_center()))
+        self.play(token.animate.move_to(layer2.get_center()))
+
+        loop_text = Text("Complex token -> Loops back!", font_size=24, color=RED).next_to(loop_back, UP)
+        self.play(Create(loop_back), Write(loop_text))
+        self.play(token.animate.move_to(layer1.get_center()))
+        self.play(token.animate.move_to(RIGHT*4))
+
+        self.wait(2)
+        self.play(FadeOut(VGroup(layer1, layer2, l1_text, l2_text, token, loop_back, loop_text, topic2)))
+
+        # 3. Geometric Decoding & Code Gen (Visual)
+        topic3 = Text("Geometric Decoding for Code", font_size=40, color=YELLOW).to_edge(UP)
         self.play(Write(topic3))
 
-        router_text = Text("Arbitrary Layer Graph Routing (ALGR)\n- Dynamically routes data through layers\n- Adjusts computation depth based on token complexity\n- Prevents routing collapse with soft maximum loops", font_size=28)
-        self.play(FadeIn(router_text))
-        self.wait(3)
-        self.play(FadeOut(router_text), FadeOut(topic3))
+        vector_plane = Axes(x_range=[-3, 3, 1], y_range=[-3, 3, 1], x_length=5, y_length=5).shift(LEFT*2)
+        concept_vec = Arrow(vector_plane.c2p(0,0), vector_plane.c2p(2, 1), buff=0, color=BLUE)
+        delta_vec = Arrow(vector_plane.c2p(2,1), vector_plane.c2p(1, 2.5), buff=0, color=GREEN)
 
-        # 4. Truncated BPTT
-        topic4 = Text("4. Handling Massive Traces: Truncated BPTT", font_size=40, color=YELLOW).to_edge(UP)
+        vec_text1 = Text("Latent Concept", font_size=20, color=BLUE).next_to(vector_plane.c2p(2,1), DOWN)
+        vec_text2 = Text("Delta Difference", font_size=20, color=GREEN).next_to(vector_plane.c2p(1,2.5), UP)
+
+        code_block = Code(code="fn main() {\n  println!(\"Hello\");\n}", language="rust", font_size=20, insert_line_no=False).shift(RIGHT*3)
+        mapping_arrow = Arrow(vector_plane.c2p(1, 2.5), code_block.get_left(), buff=0.5, color=YELLOW)
+        map_text = Text("Decodes to Structure", font_size=20).next_to(mapping_arrow, UP)
+
+        self.play(Create(vector_plane))
+        self.play(GrowArrow(concept_vec), Write(vec_text1))
+        self.play(GrowArrow(delta_vec), Write(vec_text2))
+        self.play(GrowArrow(mapping_arrow), Write(map_text), FadeIn(code_block))
+
+        self.wait(3)
+        self.play(FadeOut(VGroup(vector_plane, concept_vec, delta_vec, vec_text1, vec_text2, code_block, mapping_arrow, map_text, topic3)))
+
+        # 4. Truncated BPTT (Visual)
+        topic4 = Text("Truncated BPTT: Massive Traces", font_size=40, color=YELLOW).to_edge(UP)
         self.play(Write(topic4))
 
-        tbptt_text = Text("Chunked State-Passing for Infinite Context\n1. Sequence chunked into 4096 tokens\n2. Forward pass extracts hidden state\n3. Graph detached to prevent OOM\n4. State re-injected for next chunk", font_size=28)
-        self.play(FadeIn(tbptt_text))
-        self.wait(3)
-        self.play(FadeOut(tbptt_text), FadeOut(topic4))
+        trace = Rectangle(width=8, height=1, color=WHITE).shift(DOWN*1)
+        trace_text = Text("Infinite Reasoning Context", font_size=24).move_to(trace)
 
-        # 5. Latent World Modeling & Q-value Estimation
-        topic5 = Text("5. Latent World Modeling & Q-value Estimation", font_size=40, color=YELLOW).to_edge(UP)
+        chunk = Rectangle(width=2, height=1.2, color=YELLOW, fill_opacity=0.3).align_to(trace, LEFT)
+        chunk_text = Text("4096 Tokens", font_size=16).next_to(chunk, UP)
+
+        self.play(Create(trace), Write(trace_text))
+        self.play(Create(chunk), Write(chunk_text))
+
+        for i in range(3):
+            self.play(chunk.animate.shift(RIGHT*2), run_time=1)
+            state_text = Text("State Detached & Passed", font_size=16, color=GREEN).next_to(chunk, DOWN)
+            self.play(Write(state_text), run_time=0.5)
+            self.play(FadeOut(state_text), run_time=0.5)
+
+        self.wait(1)
+        self.play(FadeOut(VGroup(trace, trace_text, chunk, chunk_text, topic4)))
+
+        # 5. Benefits, Flaws, and Future
+        topic5 = Text("Capabilities, Limits, and Future", font_size=40, color=YELLOW).to_edge(UP)
         self.play(Write(topic5))
 
-        world_text = Text("Improved Reasoning:\n- Connects world modeling to Q-value estimation\n- Predicts abstract concepts, not just tokens\n- Streaming frontier data is vectorized offline for training", font_size=28)
-        self.play(FadeIn(world_text))
-        self.wait(3)
-        self.play(FadeOut(world_text), FadeOut(topic5))
+        capabilities = Text("Capabilities: Connects world models to Q-value estimation.\nSelf-corrects using GRPO/RLVR verifiable loops.", font_size=24, color=GREEN)
+        flaws = Text("Limits: Scaling latent models limits long-term stability at huge sizes.", font_size=24, color=RED).next_to(capabilities, DOWN, buff=0.5)
+        future = Text("Future: Hierarchical latent projections for next-gen reasoning.", font_size=24, color=BLUE).next_to(flaws, DOWN, buff=0.5)
 
-        # 6. Tri-Partite Loss & Delta-JEPA
-        topic6 = Text("6. Tri-Partite Loss & Delta-JEPA Decoding", font_size=40, color=YELLOW).to_edge(UP)
+        self.play(FadeIn(capabilities))
+        self.play(FadeIn(flaws))
+        self.play(FadeIn(future))
+        self.wait(4)
+        self.play(FadeOut(capabilities), FadeOut(flaws), FadeOut(future), FadeOut(topic5))
+
+        # 6. Benchmarks Finale (Reasoning vs SWE)
+        topic6 = Text("Capabilities vs Frontier Models", font_size=40, color=YELLOW).to_edge(UP)
         self.play(Write(topic6))
 
-        loss_eq = Text("L_total = L_CE + lambda_JEPA * L_JEPA + lambda_Route * L_Route", font_size=32)
-        loss_text = Text("CE: Syntax | JEPA: Concept Alignment | Route: Sparsity", font_size=24).next_to(loss_eq, DOWN)
-        jepa_text = Text("Delta-JEPA: Reconstructs code structures geometrically\nfrom latent difference vectors.", font_size=24).next_to(loss_text, DOWN)
+        # Real-ish estimates for models
+        # Reasoning, SWE
+        models = ["Gemma4", "Nemotron", "Qwen3.5", "GLM5.2", "Qwen3.6", "Agents A1", "JEPA-8B\n(Min-Max)"]
 
-        self.play(Write(loss_eq))
-        self.play(FadeIn(loss_text), FadeIn(jepa_text))
-        self.wait(4)
-        self.play(FadeOut(loss_eq), FadeOut(loss_text), FadeOut(jepa_text), FadeOut(topic6))
+        # Approximations to show progression
+        reasoning_scores = [70, 75, 82, 85, 88, 92, 90]
+        swe_scores =       [65, 72, 78, 80, 86, 95, 89]
 
-        # 7. GRPO and RLVR
-        topic7 = Text("7. GRPO and RLVR Feedback Loops", font_size=40, color=YELLOW).to_edge(UP)
-        self.play(Write(topic7))
 
-        grpo_text = Text("Group Relative Policy Optimization (GRPO)\nwith Verifiable Rewards (RLVR)\n- No subjective Reward Model\n- Deterministic checks via rustc compilers\n- Rewards normalized across groups", font_size=28)
-        self.play(FadeIn(grpo_text))
-        self.wait(3)
-        self.play(FadeOut(grpo_text), FadeOut(topic7))
 
-        # 8. Benefits, Flaws, and Future
-        topic8 = Text("8. The Good, The Bad, and The Future", font_size=40, color=YELLOW).to_edge(UP)
-        self.play(Write(topic8))
+        # Create grouped bar chart manually
+        group = VGroup()
+        for i, (r_val, s_val, name) in enumerate(zip(reasoning_scores, swe_scores, models)):
+            bar_r = Rectangle(width=0.4, height=(r_val/100)*4, color=BLUE, fill_opacity=0.8)
+            bar_s = Rectangle(width=0.4, height=(s_val/100)*4, color=RED, fill_opacity=0.8)
 
-        benefits = Text("Benefits: Developers train on large reasoning datasets locally", font_size=24, color=GREEN)
-        flaws = Text("Flaws/Limits: Scaling latent world models introduces instability at huge sizes", font_size=24, color=RED).next_to(benefits, DOWN)
-        future = Text("Future: Hierarchical latent projections for next-gen reasoning", font_size=24, color=BLUE).next_to(flaws, DOWN)
+            # For JEPA-8B, we'll draw error bars or ranges
+            if name == "JEPA-8B\n(Min-Max)":
+                bar_r.set_color(GREEN)
+                bar_s.set_color(YELLOW)
 
-        self.play(FadeIn(benefits), FadeIn(flaws), FadeIn(future))
-        self.wait(4)
-        self.play(FadeOut(benefits), FadeOut(flaws), FadeOut(future), FadeOut(topic8))
+                # Min-Max ranges: Reasoning (84-94), SWE (81-93)
+                r_min_line = Line(bar_r.get_bottom(), bar_r.get_bottom() + UP*(84/100)*4, color=GREEN_E, stroke_width=8)
+                s_min_line = Line(bar_s.get_bottom(), bar_s.get_bottom() + UP*(81/100)*4, color=YELLOW_E, stroke_width=8)
+                pair.add(r_min_line, s_min_line)
 
-        # 9. Benchmarks Finale
-        topic9 = Text("9. Projected Benchmarks vs Frontier Models", font_size=40, color=YELLOW).to_edge(UP)
-        self.play(Write(topic9))
+            pair = VGroup(bar_r, bar_s).arrange(RIGHT, buff=0.1)
+            pair.move_to(DOWN*1.5 + LEFT*5 + RIGHT*(i*1.7), aligned_edge=DOWN)
 
-        # Simple Bar Chart
-        chart = BarChart(
-            values=[45, 60, 75, 88, 92],
-            bar_names=["Llama-3-8B", "GPT-3.5", "Claude 3 Haiku", "Mamba2-JEPA-8B", "GPT-4o / Claude 3.5"],
-            y_range=[0, 100, 20],
-            y_length=4,
-            x_length=10,
-            x_axis_config={"font_size": 24}
-        )
-        chart_label = Text("Reasoning Benchmark Score (%)", font_size=24).next_to(chart, UP)
+            label = Text(name, font_size=16).next_to(pair, DOWN)
+            group.add(pair, label)
 
-        self.play(Create(chart), FadeIn(chart_label))
+        axes = Axes(x_range=[0, 13, 1], y_range=[0, 100, 20], x_length=12, y_length=4).shift(UP*0.5)
+
+        legend_r = Rectangle(width=0.5, height=0.5, color=BLUE, fill_opacity=0.8)
+        legend_r_text = Text("Reasoning", font_size=20).next_to(legend_r, RIGHT)
+        legend_s = Rectangle(width=0.5, height=0.5, color=RED, fill_opacity=0.8)
+        legend_s_text = Text("SWE (Code)", font_size=20).next_to(legend_s, RIGHT)
+
+        legend = VGroup(legend_r, legend_r_text, legend_s, legend_s_text).arrange(RIGHT, buff=0.5).to_edge(UP).shift(DOWN*1)
+
+        self.play(Create(axes), FadeIn(legend))
+        self.play(FadeIn(group), run_time=2)
+
+        # Highlight JEPA range
+        jepa_highlight = Text("Estimated Min/Max", font_size=16, color=YELLOW).next_to(group[-2], UP)
+        self.play(Write(jepa_highlight))
+
         self.wait(5)
-        self.play(FadeOut(chart), FadeOut(chart_label), FadeOut(topic9))
+        self.play(FadeOut(axes), FadeOut(group), FadeOut(legend), FadeOut(topic6), FadeOut(jepa_highlight))
 
         # Outro
         outro = Text("Thanks for watching!", font_size=48, color=BLUE)
