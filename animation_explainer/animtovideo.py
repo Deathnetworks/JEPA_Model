@@ -6,7 +6,7 @@ def main():
     print("Starting Manim animation render...")
 
     # Read custom config
-    with open("custom_config.yml", "r") as f:
+    with open("custom_config.cfg", "r") as f:
         config = yaml.safe_load(f)
 
     cli_cfg = config.get("CLI", {})
