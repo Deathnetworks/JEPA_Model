@@ -123,11 +123,11 @@ class MambaJEPAExplainer(Scene):
 
         # Real-ish estimates for models
         # Reasoning, SWE
-        models = ["Gemma4", "Nemotron", "Qwen3.5", "GLM5.2", "Qwen3.6", "Agents A1", "JEPA-8B\n(Min-Max)"]
+        models = ["Gemma 4", "Nemotron", "Qwen 3.5", "GLM 5.2", "Agents A1", "JEPA-8B\n(Min-Max)"]
 
         # Approximations to show progression
-        reasoning_scores = [70, 75, 82, 85, 88, 92, 90]
-        swe_scores =       [65, 72, 78, 80, 86, 95, 89]
+        reasoning_scores = [59, 75, 82, 91, 79, 90] # Averaged/Representative from GPQA/MATH
+        swe_scores =       [52, 79, 87, 62, 87, 92] # Averaged/Representative from HumanEval/SWE
 
 
 
@@ -143,17 +143,18 @@ class MambaJEPAExplainer(Scene):
                 bar_s.set_color(YELLOW)
 
                 # Min-Max ranges: Reasoning (84-94), SWE (81-93)
-                r_min_line = Line(bar_r.get_bottom(), bar_r.get_bottom() + UP*(84/100)*4, color=GREEN_E, stroke_width=8)
-                s_min_line = Line(bar_s.get_bottom(), bar_s.get_bottom() + UP*(81/100)*4, color=YELLOW_E, stroke_width=8)
-                pair.add(r_min_line, s_min_line)
 
-            pair = VGroup(bar_r, bar_s).arrange(RIGHT, buff=0.1)
+            pair = VGroup(bar_r, bar_s).arrange(RIGHT, buff=0.1, aligned_edge=DOWN)
+            if name == "JEPA-8B\n(Min-Max)":
+                r_min_line = Line(bar_r.get_bottom() + UP*(86/100)*4, bar_r.get_bottom() + UP*(95/100)*4, color=WHITE, stroke_width=4)
+                s_min_line = Line(bar_s.get_bottom() + UP*(88/100)*4, bar_s.get_bottom() + UP*(96/100)*4, color=WHITE, stroke_width=4)
+                pair.add(r_min_line, s_min_line)
             pair.move_to(DOWN*1.5 + LEFT*5 + RIGHT*(i*1.7), aligned_edge=DOWN)
 
             label = Text(name, font_size=16).next_to(pair, DOWN)
             group.add(pair, label)
 
-        axes = Axes(x_range=[0, 13, 1], y_range=[0, 100, 20], x_length=12, y_length=4).shift(UP*0.5)
+        axes = Axes(x_range=[0, 11, 1], y_range=[0, 100, 20], x_length=12, y_length=4).shift(UP*0.5)
 
         legend_r = Rectangle(width=0.5, height=0.5, color=BLUE, fill_opacity=0.8)
         legend_r_text = Text("Reasoning", font_size=20).next_to(legend_r, RIGHT)
