@@ -126,8 +126,8 @@ class MambaJEPAExplainer(Scene):
         models = ["Gemma 4", "Nemotron", "Qwen 3.5", "GLM 5.2", "Agents A1", "JEPA-8B\n(Min-Max)"]
 
         # Approximations to show progression
-        reasoning_scores = [59, 75, 82, 91, 79, 90] # Averaged/Representative from GPQA/MATH
-        swe_scores =       [52, 79, 87, 62, 87, 92] # Averaged/Representative from HumanEval/SWE
+        reasoning_scores = [59, 75, 82, 91, 79, 77] # Averaged/Representative from GPQA/MATH
+        swe_scores =       [52, 79, 87, 62, 87, 80] # Averaged/Representative from HumanEval/SWE
 
 
 
@@ -146,8 +146,8 @@ class MambaJEPAExplainer(Scene):
 
             pair = VGroup(bar_r, bar_s).arrange(RIGHT, buff=0.1, aligned_edge=DOWN)
             if name == "JEPA-8B\n(Min-Max)":
-                r_min_line = Line(bar_r.get_bottom() + UP*(86/100)*4, bar_r.get_bottom() + UP*(95/100)*4, color=WHITE, stroke_width=4)
-                s_min_line = Line(bar_s.get_bottom() + UP*(88/100)*4, bar_s.get_bottom() + UP*(96/100)*4, color=WHITE, stroke_width=4)
+                r_min_line = Line(bar_r.get_bottom() + UP*(70/100)*4, bar_r.get_bottom() + UP*(85/100)*4, color=WHITE, stroke_width=4)
+                s_min_line = Line(bar_s.get_bottom() + UP*(72/100)*4, bar_s.get_bottom() + UP*(88/100)*4, color=WHITE, stroke_width=4)
                 pair.add(r_min_line, s_min_line)
             pair.move_to(DOWN*1.5 + LEFT*5 + RIGHT*(i*1.7), aligned_edge=DOWN)
 
