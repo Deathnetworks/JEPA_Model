@@ -69,7 +69,7 @@ class MambaJEPAExplainer(Scene):
         vec_text1 = Text("Latent Concept", font_size=20, color=BLUE).next_to(vector_plane.c2p(2,1), DOWN)
         vec_text2 = Text("Delta Difference", font_size=20, color=GREEN).next_to(vector_plane.c2p(1,2.5), UP)
 
-        code_block = Code(code="fn main() {\n  println!(\"Hello\");\n}", language="rust", font_size=20, insert_line_no=False).shift(RIGHT*3)
+        code_block = Code(code_string="fn main() {\n  println!(\"Hello\");\n}", language="rust", font_size=20, insert_line_no=False).shift(RIGHT*3)
         mapping_arrow = Arrow(vector_plane.c2p(1, 2.5), code_block.get_left(), buff=0.5, color=YELLOW)
         map_text = Text("Decodes to Structure", font_size=20).next_to(mapping_arrow, UP)
 
