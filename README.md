@@ -4,6 +4,19 @@ An advanced, locally-trained 8B reasoning model built from scratch on the Intel 
 
 Instead of generating synthetic data locally, this pipeline operates via a high-speed featurization engine that streams, extracts, and vectorizes bleeding-edge reasoning traces from frontier models (Claude Opus/Fable, GPT-5.5, Gemini 3.5, Qwen 3.7) to train the student's latent world model.
 
+
+
+
+
+
+https://github.com/user-attachments/assets/4f29ea9c-d65c-42d8-8845-62f23f175782
+
+
+https://github.com/user-attachments/assets/792bd2c6-8da9-466d-b81b-1ef40aaf23bf
+
+
+
+
 ---
 
 ## 🚀 Architectural Overview
