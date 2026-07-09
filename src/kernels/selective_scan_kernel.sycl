@@ -1,0 +1,47 @@
+#include <sycl/sycl.hpp>
+
+using namespace sycl;
+
+template<typename scalar_t>
+void selective_scan_kernel(
+    sycl::queue &q,
+    scalar_t* x,
+    scalar_t* dt,
+    scalar_t* A,
+    scalar_t* B,
+    scalar_t* C,
+    scalar_t* out,
+    int batch, int seqlen, int dim, int dstate)
+{
+    q.submit([&](handler &h) {
+        // Tiling could be used here to reduce global memory pressure for large sequence chunking.
+
+        h.parallel_for(nd_range<2>(
+            range<2>(batch, seqlen),
+            range<2>(1, 32) // Tune workgroup size for Arc (e.g. 32/64 threads)
+        ), [=](nd_item<2> item) {
+            int b = item.get_global_id(0);
+            int t = item.get_global_id(1);
+
+            if (t >= seqlen || b >= batch) return;
+
+            // Compute indices
+            // NOTE: This is a placeholder naive recurrent step for conceptual parity.
+            // Full multi-channel unrolling must be expanded.
+
+            // scalar_t dt_t = dt[b * seqlen * dim + t * dim];
+            // scalar_t a = A[0];
+            // scalar_t b_val = B[b * seqlen * dstate + t * dstate];
+            // scalar_t c_val = C[b * seqlen * dstate + t * dstate];
+
+            // scalar_t decay = sycl::exp(-dt_t * a);
+            // scalar_t x_t = x[b * seqlen * dim + t * dim];
+
+            // scalar_t h_new = decay * 0.0f + (1.0f - decay) * b_val * x_t;
+
+            // out[b * seqlen * dim + t * dim] = h_new * c_val;
+
+            out[b * seqlen * dim + t * dim] = x[b * seqlen * dim + t * dim]; // Mock pass-through
+        });
+    });
+}

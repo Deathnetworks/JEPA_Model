@@ -125,3 +125,19 @@ Train the Closed-Loop Latent Decoder on the extracted concepts.
 ```bash
 python src/train_decoder.py
 ```
+## JEPA_Model v2
+This repository is currently undergoing a structural update to version 2, adding:
+- Modular architecture
+- Native SYCL kernels for Intel XPU (Arc Pro B70)
+- Config-driven training loops
+- Streamlined `datasets` pipeline
+
+### Quickstart
+```bash
+pip install -r requirements.txt
+pip install -e .
+python src/train_latent_loop.py --config configs/default.yaml
+```
+
+### Architecture Overview
+*(Mermaid Diagram Coming Soon)*

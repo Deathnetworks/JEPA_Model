@@ -1,0 +1,20 @@
+# JEPA_Model v2 Default Configuration
+model:
+  d_model: 6144
+  d_state: 256
+  nheads: 128
+  num_blocks: 32
+  max_budget: 64
+
+training:
+  batch_size: 4
+  learning_rate: 1.0e-4
+  gradient_accumulation_steps: 4
+  epochs: 3
+  logging_steps: 10
+  checkpoint_dir: "./checkpoints"
+
+data:
+  dataset_name: "Qwen/Qwen3.6-27B"
+  seq_len: 2048
+  streaming: true

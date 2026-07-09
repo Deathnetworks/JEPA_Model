@@ -1,55 +1,32 @@
 import sys
 import os
 import torch
+import pytest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.model_architecture import MambaJEPAEngine, DualStageLatentDecoder
+from src.model.backbone.mamba_engine import MambaJEPAEngine
 
 def test_engine_tensor_shapes():
     """
-    Validates that the Mamba2-JEPA execution loop yields the exact tensor 
-    dimensions specified in the master architecture document.
+    Validates that the modular Mamba2-JEPA execution loop yields the exact tensor
+    dimensions required.
     """
-    device = torch.device("xpu" if torch.xpu.is_available() else "cpu")
-    print(f"[TEST RUNNER] Executing on natively targeted compute engine: {device}")
+    device = torch.device("xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu")
 
-    # Initialize a miniature version of the 8B engine for local memory safety
+    # Initialize a miniature version for testing
     d_model = 64
     num_blocks = 2
-    model = MambaJEPAEngine(vocab_size=151643, d_model=d_model, num_blocks=num_blocks, max_budget=4, d_latent=5120).to(device)
-    decoder = DualStageLatentDecoder(d_latent=5120, max_seq_len=512, d_model=d_model, vocab_size=151643).to(device)
-
-    model.eval()
-    decoder.eval()
+    vocab_size = 151643
+    model = MambaJEPAEngine(vocab_size=vocab_size, d_model=d_model, num_blocks=num_blocks, use_sycl_kernel=False).to(device)
 
     batch_size = 2
-    seq_len = 512
-    mock_tokens = torch.randint(0, 151643, (batch_size, seq_len)).to(device)
-
-    # Initial state for Chunk 1
-    mamba_state = None
-
-    with torch.no_grad():
-        # Execute the ALGR routed forward pass
-        jepa_concept, global_steps, final_state = model(mock_tokens, mamba_state=mamba_state)
-        logits = decoder(jepa_concept)
-
-    print("\n--- Tensor Dimensionality Report ---")
+    seq_len = 16
     
-    # 1. Check Logits (Cross-Entropy Target)
-    print(f"Logits Shape: {list(logits.shape)}")
-    assert logits.shape == (batch_size, seq_len, 151643), "❌ Logit dimension mismatch."
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len)).to(device)
     
-    # 2. Check JEPA Projection Vector
-    print(f"JEPA Concept Shape: {list(jepa_concept.shape)}")
-    assert jepa_concept.shape == (batch_size, 5120), "❌ JEPA Concept dimension mismatch."
+    # Forward Pass
+    logits, h = model(input_ids, max_budget=2)
 
-    # 3. Check Mamba2 Recurrent State Matrix (For TBPTT state-passing)
-    # Expected: [Batch, num_blocks, nheads, d_state, d_state]
-    print(f"Mamba State Shape: {list(final_state.shape)}")
-    assert final_state.dim() == 5, "❌ Mamba state matrix lacks expected recurrence depth."
-
-    print("\n[TEST SUCCESS] All tensor shapes structurally align with ARCHITECTURE_SPEC.md")
-
-if __name__ == "__main__":
-    test_engine_tensor_shapes()
+    # Assertions
+    assert h.shape == (batch_size, seq_len, 2048), f"Expected latent state shape (batch_size, seq_len, 2048), got {h.shape}"
+    assert logits.shape == (batch_size, seq_len, vocab_size), f"Expected logits shape (batch_size, seq_len, vocab_size), got {logits.shape}"
