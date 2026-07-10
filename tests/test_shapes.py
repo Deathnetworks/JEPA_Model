@@ -16,15 +16,15 @@ def test_engine_tensor_shapes():
     # Initialize a miniature version of the 8B engine for local memory safety
     d_model = 64
     num_blocks = 2
-    model = MambaJEPAEngine(vocab_size=151643, d_model=d_model, num_blocks=num_blocks, max_budget=4, d_latent=5120).to(device)
-    decoder = DualStageLatentDecoder(d_latent=5120, max_seq_len=512, d_model=d_model, vocab_size=151643).to(device)
+    model = MambaJEPAEngine(vocab_size=32000, d_model=d_model, num_blocks=num_blocks, max_budget=4, d_latent=5120).to(device)
+    decoder = DualStageLatentDecoder(d_latent=5120, max_seq_len=512, d_model=d_model, vocab_size=32000).to(device)
 
     model.eval()
     decoder.eval()
 
     batch_size = 2
     seq_len = 512
-    mock_tokens = torch.randint(0, 151643, (batch_size, seq_len)).to(device)
+    mock_tokens = torch.randint(0, 32000, (batch_size, seq_len)).to(device)
 
     # Initial state for Chunk 1
     mamba_state = None
@@ -38,7 +38,7 @@ def test_engine_tensor_shapes():
     
     # 1. Check Logits (Cross-Entropy Target)
     print(f"Logits Shape: {list(logits.shape)}")
-    assert logits.shape == (batch_size, seq_len, 151643), "❌ Logit dimension mismatch."
+    assert logits.shape == (batch_size, seq_len, 32000), "❌ Logit dimension mismatch."
     
     # 2. Check JEPA Projection Vector
     print(f"JEPA Concept Shape: {list(jepa_concept.shape)}")

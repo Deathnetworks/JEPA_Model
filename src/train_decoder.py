@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from src.runtime import get_device, empty_cache, get_autocast_kwargs
 from torch.utils.data import Dataset, DataLoader
 import bitsandbytes as bnb
 
@@ -66,7 +67,7 @@ def train_decoder_loop(
     learning_rate=1e-4,
     data_dir=r"F:\JEPA_Model\data\shards"
 ):
-    device = torch.device("xpu" if torch.xpu.is_available() else "cpu")
+    device = get_device()
     logging.info(f"Targeting native compute via device: {device}")
 
     if device.type == 'cpu':
@@ -107,7 +108,9 @@ def train_decoder_loop(
                 target_concepts_list = [item["target_concept"] for item in mini_batch]
                 qwen_tokens_list = [item["qwen_tokens"] for item in mini_batch]
 
-                target_concept = torch.stack(target_concepts_list).to(device)
+                bge_targets = torch.stack(target_concepts_list).to(device)
+                target_concept = torch.zeros(bge_targets.size(0), 5120, device=device, dtype=bge_targets.dtype)
+                target_concept[:, :1024] = bge_targets
 
                 max_len = model.max_seq_len
                 # Slice target sequence to max_len + 1 to safely capture autoregressive shifted offsets
@@ -126,7 +129,7 @@ def train_decoder_loop(
 
                 optimizer.zero_grad()
 
-                with torch.autocast(device_type="xpu" if device.type == "xpu" else "cpu", dtype=torch.bfloat16 if device.type == "xpu" else torch.float32):
+                with torch.autocast(**get_autocast_kwargs()):
                     # Forward pass conditions token generation on both history and the concept vector
                     logits = model(decoder_input, target_concept)
 
@@ -139,8 +142,7 @@ def train_decoder_loop(
                 loss.backward()
                 optimizer.step()
 
-                if hasattr(torch, 'xpu') and hasattr(torch.xpu, 'empty_cache'):
-                    torch.xpu.empty_cache()
+                empty_cache()
 
                 if (i // mini_batch_size) % 10 == 0:
                     print(
@@ -158,7 +160,8 @@ def train_decoder_loop(
                             loss.item()
                         ])
 
-    torch.save(model.state_dict(), "latent_decoder.pth")
+    raw_model = getattr(model, "_orig_mod", model)
+    torch.save(raw_model.state_dict(), "latent_decoder.pth")
     logging.info("Model saved to latent_decoder.pth")
 
 if __name__ == "__main__":
