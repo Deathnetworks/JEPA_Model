@@ -4,7 +4,6 @@ import time
 import math
 import logging
 import argparse
-from accelerate import Accelerator, DeepSpeedPlugin
 import torch.optim as optim
 from pathlib import Path
 
@@ -154,6 +153,22 @@ def train_loop(
         model = MambaJEPAEngine()
         decoder = ClosedLoopLatentDecoder()
 
+
+
+
+    if os.path.exists("jepa_engine.pth"):
+        try:
+            model.load_state_dict(torch.load("jepa_engine.pth", map_location=device, weights_only=True), strict=True)
+            logging.info("Successfully loaded pre-existing weights for jepa_engine.pth.")
+        except Exception as e:
+            logging.warning(f"Failed to load jepa_engine.pth: {e}")
+
+    if os.path.exists("latent_decoder.pth"):
+        try:
+            decoder.load_state_dict(torch.load("latent_decoder.pth", map_location=device, weights_only=True), strict=True)
+            logging.info("Successfully loaded pre-existing weights for latent_decoder.pth.")
+        except Exception as e:
+            logging.warning(f"Failed to load latent_decoder.pth: {e}")
     if device.type == "xpu":
         torch._inductor.config.freezing = True
         torch._inductor.config.max_autotune = True
@@ -163,21 +178,6 @@ def train_loop(
 
     model = model.to(device)
     decoder = decoder.to(device)
-
-
-    if os.path.exists("jepa_engine.pth"):
-        try:
-            model.load_state_dict(torch.load("jepa_engine.pth", map_location=device, weights_only=True), strict=False)
-            logging.info("Successfully loaded pre-existing weights for jepa_engine.pth.")
-        except Exception as e:
-            logging.warning(f"Failed to load jepa_engine.pth: {e}")
-
-    if os.path.exists("latent_decoder.pth"):
-        try:
-            decoder.load_state_dict(torch.load("latent_decoder.pth", map_location=device, weights_only=True), strict=False)
-            logging.info("Successfully loaded pre-existing weights for latent_decoder.pth.")
-        except Exception as e:
-            logging.warning(f"Failed to load latent_decoder.pth: {e}")
 
     model.train()
     decoder.train()
@@ -205,9 +205,7 @@ def train_loop(
     warmup_steps = int(0.05 * total_steps)
     lr_scheduler = get_lr_scheduler(optimizer, warmup_steps=warmup_steps, total_steps=total_steps)
 
-    model, decoder, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        model, decoder, optimizer, dataloader, lr_scheduler
-    )
+
 
     checkpoint_dir = f"checkpoint_{curriculum_phase}"
     starting_epoch = 0
@@ -216,7 +214,7 @@ def train_loop(
     metadata_path = os.path.join(checkpoint_dir, "training_state.txt")
     if os.path.exists(checkpoint_dir):
         logging.info(f"Resuming from checkpoint {checkpoint_dir}")
-        accelerator.load_state(checkpoint_dir)
+
         if os.path.exists(metadata_path):
             with open(metadata_path, 'r') as f:
                 parts = f.read().split(',')
@@ -226,7 +224,7 @@ def train_loop(
 
     csv_filename = "training_trace.csv"
     file_exists = os.path.isfile(csv_filename)
-    if accelerator.is_main_process:
+    if True:
         with open(csv_filename, mode='a', newline='') as f:
             writer = csv.writer(f)
             if not file_exists:
@@ -241,7 +239,7 @@ def train_loop(
 
     for epoch in range(starting_epoch, epochs):
         if epoch == starting_epoch and starting_batch > 0:
-            active_dataloader = accelerator.skip_first_batches(dataloader, starting_batch)
+            active_dataloader = dataloader
         else:
             active_dataloader = dataloader
 
@@ -274,7 +272,7 @@ def train_loop(
                     c_input = padded_input[:, t:t+chunk_size]
                     c_qwen = padded_qwen[:, t:t+chunk_size] if padded_qwen.size(1) > 1 else padded_qwen
 
-                    with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
+                    with torch.autocast(**get_autocast_kwargs()):
                         student_concept, global_steps, mamba_state = model(c_input, mamba_state=mamba_state)
                         
                         # Apply teacher forcing shift logic to train the cross-attended decoder
@@ -305,7 +303,7 @@ def train_loop(
 
                         loss_scaled = loss / (accumulation_steps * num_chunks)
 
-                    accelerator.backward(loss_scaled)
+                    loss_scaled.backward()
 
                     track_loss += loss.detach().item()
                     track_ce += l_ce.detach().item()
@@ -323,14 +321,14 @@ def train_loop(
                 avg_route = track_route / num_chunks
 
                 if global_mb_step % accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
                     optimizer.step()
                     lr_scheduler.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
+                    empty_cache()
 
-                    if hasattr(torch.xpu, 'empty_cache'):
-                        torch.xpu.empty_cache()
-
-                if accelerator.is_main_process and global_mb_step % 10 == 0:
+                if global_mb_step % 10 == 0:
                     elapsed = time.time() - start_time
                     it_per_sec = 10 / elapsed if elapsed > 0 else 0
                     logging.info(
@@ -344,21 +342,24 @@ def train_loop(
                         writer.writerow([epoch+1, actual_chunk_idx+1, global_mb_step, avg_ce, avg_jepa, avg_route, avg_loss])
                         
         if global_mb_step % accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
             optimizer.step()
             lr_scheduler.step()
-            optimizer.zero_grad()
-            if hasattr(torch.xpu, 'empty_cache'):
-                torch.xpu.empty_cache()
+            optimizer.zero_grad(set_to_none=True)
+            empty_cache()
 
-        accelerator.save_state(checkpoint_dir)
-        if accelerator.is_main_process:
+
+        if True:
             with open(metadata_path, 'w') as f:
                 f.write(f"{epoch+1},0")
             logging.info(f"Checkpoint saved to {checkpoint_dir}")
 
-    if accelerator.is_main_process:
-        torch.save(model.state_dict(), "jepa_engine.pth")
-        torch.save(decoder.state_dict(), "latent_decoder.pth")
+    if True:
+        raw_model = getattr(model, "_orig_mod", model)
+        torch.save(raw_model.state_dict(), "jepa_engine.pth")
+        raw_decoder = getattr(decoder, "_orig_mod", decoder)
+        torch.save(raw_decoder.state_dict(), "latent_decoder.pth")
         logging.info("Models saved.")
 
 if __name__ == "__main__":

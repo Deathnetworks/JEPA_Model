@@ -8,7 +8,6 @@ import torch.nn as nn
 from datasets import load_dataset
 from transformers import AutoTokenizer
 import bitsandbytes as bnb
-from accelerate import Accelerator, DeepSpeedPlugin
 import torch.optim as optim
 
 try:
@@ -21,30 +20,7 @@ from src.GRPOLearningEngine import GRPOLearningEngine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def setup_accelerator():
-    """
-    Initializes the Hugging Face Accelerator with DeepSpeed ZeRO-2 
-    to offload optimizer states to system RAM.
-    """
-    deepspeed_plugin = DeepSpeedPlugin(
-        zero_stage=2,
-        offload_optimizer_device="cpu",
-        offload_param_device="none", # Keep weights on XPU for maximum compute speed
-        gradient_accumulation_steps=16,
-        gradient_clipping=1.0
-    )
-    
-    accelerator = Accelerator(
-        gradient_accumulation_steps=16, 
-        deepspeed_plugin=deepspeed_plugin
-    )
-    
-    if accelerator.device.type == "xpu":
-        logging.info(f"Targeting native Intel GPU compute via device: {accelerator.device}")
-    else:
-        logging.warning("XPU not available, falling back to CPU. Performance will be degraded.")
-        
-    return accelerator
+
 
 def stream_rl_prompts(dataset_name="ise-uiuc/Magicoder-OSS-Instruct-75K", start_idx=0):
     """
@@ -64,9 +40,8 @@ def train_rl_loop(
     decoder_path: str = "latent_decoder.pth",
     tokenizer_name: str = "Qwen/Qwen2.5-7B-Instruct",
 ):
-    # --- FIX: Initialize the accelerator WITH the DeepSpeed plugin ---
-    accelerator = setup_accelerator()
-    device = accelerator.device
+    from src.runtime import get_device, empty_cache, get_autocast_kwargs
+    device = get_device()
 
     logging.info(f"Loading tokenizer {tokenizer_name}...")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
@@ -85,6 +60,20 @@ def train_rl_loop(
         model = MambaJEPAEngine()
         decoder = ClosedLoopLatentDecoder()
 
+
+
+    logging.info(f"Loading weights from {engine_path} and {decoder_path}...")
+    try:
+        model.load_state_dict(torch.load(engine_path, map_location=device, weights_only=True), strict=True)
+        logging.info(f"Successfully loaded {engine_path}")
+    except FileNotFoundError:
+        logging.warning(f"Could not find {engine_path}, initializing with random weights.")
+
+    try:
+        decoder.load_state_dict(torch.load(decoder_path, map_location=device, weights_only=True), strict=True)
+        logging.info(f"Successfully loaded {decoder_path}")
+    except FileNotFoundError:
+        logging.warning(f"Could not find {decoder_path}, initializing with random weights.")
     if device.type == "xpu":
         torch._inductor.config.freezing = True
         torch._inductor.config.max_autotune = True
@@ -94,19 +83,6 @@ def train_rl_loop(
 
     model = model.to(device)
     decoder = decoder.to(device)
-
-    logging.info(f"Loading weights from {engine_path} and {decoder_path}...")
-    try:
-        model.load_state_dict(torch.load(engine_path, map_location=device, weights_only=True), strict=False)
-        logging.info(f"Successfully loaded {engine_path}")
-    except FileNotFoundError:
-        logging.warning(f"Could not find {engine_path}, initializing with random weights.")
-
-    try:
-        decoder.load_state_dict(torch.load(decoder_path, map_location=device, weights_only=True), strict=False)
-        logging.info(f"Successfully loaded {decoder_path}")
-    except FileNotFoundError:
-        logging.warning(f"Could not find {decoder_path}, initializing with random weights.")
 
     optimizer_grouped_parameters = [
         {"params": [p for n, p in model.named_parameters() if p.requires_grad]},
@@ -122,7 +98,6 @@ def train_rl_loop(
         weight_decay=0.1
     )
 
-    model, decoder, optimizer = accelerator.prepare(model, decoder, optimizer)
     grpo_engine = GRPOLearningEngine(model, decoder, tokenizer)
 
     checkpoint_dir = f"checkpoint_rl"
@@ -132,7 +107,7 @@ def train_rl_loop(
     metadata_path = os.path.join(checkpoint_dir, "rl_training_state.txt")
     if os.path.exists(checkpoint_dir):
         logging.info(f"Resuming from checkpoint {checkpoint_dir}")
-        accelerator.load_state(checkpoint_dir)
+
         if os.path.exists(metadata_path):
             with open(metadata_path, 'r') as f:
                 parts = f.read().split(',')
@@ -151,31 +126,38 @@ def train_rl_loop(
 
                 optimizer.zero_grad()
 
-                with torch.autocast(device_type="xpu" if device.type == "xpu" else "cpu", dtype=torch.bfloat16 if device.type == "xpu" else torch.float32):
+                with torch.autocast(**get_autocast_kwargs()):
                     loss = grpo_engine.train_grpo_step(inputs["input_ids"], optimizer, group_size=group_size)
 
-                accelerator.backward(loss)
-                optimizer.step()
+                loss_scaled = loss / 16
+                loss_scaled.backward()
 
-                if hasattr(torch.xpu, 'empty_cache'):
-                    torch.xpu.empty_cache()
+                if step_idx % 16 == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                empty_cache()
 
                 logging.info(f"Epoch {epoch+1}/{epochs} | Step {step_idx+1} | Loss: {loss.item():.4f}")
 
                 step_idx += 1
 
                 if step_idx % 100 == 0:
-                     accelerator.save_state(checkpoint_dir)
-                     if accelerator.is_main_process:
+
+                     if True:
                          with open(metadata_path, 'w') as f:
                              f.write(f"{epoch},{step_idx}")
                          logging.info(f"Checkpoint saved to {checkpoint_dir}")
             except Exception as e:
                 logging.error(f"Error during RL step {step_idx}: {e}")
 
-    if accelerator.is_main_process:
-        torch.save(model.state_dict(), "jepa_engine_rl.pth")
-        torch.save(decoder.state_dict(), "latent_decoder_rl.pth")
+    if True:
+        raw_model = getattr(model, "_orig_mod", model)
+        torch.save(raw_model.state_dict(), "jepa_engine_rl.pth")
+        raw_decoder = getattr(decoder, "_orig_mod", decoder)
+        torch.save(raw_decoder.state_dict(), "latent_decoder_rl.pth")
         logging.info("Models saved.")
 
 if __name__ == "__main__":
