@@ -1,0 +1,696 @@
+Code Review Report: JEPA_Model Repository
+
+Scope: model_architecture.py, train_latent_loop.py, train_decoder.py, train_rl_loop.py, GRPOLearningEngine.py, inference_harness.py, quantize_model.py
+Severity legend: 🔴 S0 = crashes immediately · 🟠 S1 = runs but silently corrupts training · 🟡 S2 = design/performance flaw · ⚪ S3 = minor
+
+ISSUE 1 — 🔴 Mamba2SSDBlock state-tensor shape mismatch (guaranteed crash)
+
+Where: model_architecture.py, Mamba2SSDBlock.forward and Mamba2LatentLoop8B.forward (state init)
+
+Why it's an issue. The recurrent state is initialized as:
+
+mamba_state = torch.zeros(batch, self.nheads, self.d_state, self.d_state)  # (B, 128, 256, 256)
+
+but the update writes an outer product of shape (d_state, d_head):
+
+B_t   = B[:, t].unsqueeze(-1)          # (B, 128, 256, 1)
+act_t = activated[:, t].unsqueeze(-2)  # (B, 128, 1, 64)
+mamba_state = decay * mamba_state + dt_t * torch.matmul(B_t, act_t)  # (B,128,256,256) + (B,128,256,64)
+
+(256, 256) cannot broadcast with (256, 64). Additionally, even if it could, the readout C_t @ state would produce d_state=256 per head, and out_tensor.view(batch, seq_len, self.d_inner) expects d_head=64 per head (128 × 64 = 8192), so the reshape would also fail (128 × 256 = 32768 ≠ 8192). The correct SSD state is (B, nheads, d_state, d_head): update H ← a·H + B⊗x, readout y = Cᵀ·H.
+
+What happens if not changed. Every script that touches the engine — all three training loops, inference, GRPO — throws a RuntimeError on the very first forward pass. Nothing in this repo can run.
+
+Alternative options. (a) Fix the shape and keep the hand-rolled recurrence; (b) replace the block with a vetted implementation; (c) transpose the state convention to (d_head, d_state) (equally valid, just be consistent).
+
+Solution A — minimal shape fix:
+
+# In BOTH Mamba2SSDBlock.forward and Mamba2LatentLoop8B fallback init:
+if mamba_state is None:
+    mamba_state = torch.zeros(batch, self.nheads, self.d_state, self.d_head,
+                              device=x.device, dtype=x.dtype)
+
+# update (unchanged math, now shape-consistent):
+# state: (B,H,N,P);  B_t:(B,H,N,1);  act_t:(B,H,1,P)
+mamba_state = decay * mamba_state + dt_t * (B_t @ act_t)     # (B,H,N,P)
+out_t = (C_t @ mamba_state).squeeze(-2)                       # (B,H,1,N)@(B,H,N,P) -> (B,H,P) ✓
+
+Explanation: the state per head becomes a d_state × d_head matrix, the outer product B⊗x matches it, and the contraction against C yields d_head per head, so the final .view(batch, seq, d_inner) is valid. One-line change in two places.
+
+Solution B — replace with a validated pure-PyTorch SSD kernel:
+
+# Adopt the reference "chunked SSD" from the Mamba2 paper (minimal PyTorch version):
+def ssd_forward(x, dt, A, B, C, initial_state, chunk=64):
+    # x:(B,L,H,P)  dt:(B,L,H)  B,C:(B,L,N)
+    # 1. split L into chunks of 64
+    # 2. intra-chunk: quadratic attention-like matmul (parallel)
+    # 3. inter-chunk: cumulative decay recurrence over chunk states only (L/64 steps)
+    # returns y:(B,L,H,P), final_state:(B,H,N,P)
+
+Explanation: this is the standard "state space duality" formulation — mathematically identical, but the per-token Python loop is replaced by batched matmuls within chunks plus a short recurrence across chunk boundaries. It fixes the shape bug and Issue 2 at once, and there are reference implementations (mamba2-minimal, mamba_ssm's ssd_minimal_discrete) you can port and unit-test against.
+
+Recommended: Solution B. Solution A makes the code correct but leaves it catastrophically slow (see Issue 2). Since you must touch this code anyway, port a reference chunked-SSD implementation with a unit test comparing it to the naive loop on tiny shapes. Fixing correctness and performance in one change is strictly better.
+
+ISSUE 2 — 🔴/🟡 Per-token Python recurrence makes training computationally impossible
+
+Where: Mamba2SSDBlock.forward — for t in range(seq_len):
+
+Why it's an issue. The scan is a Python-level loop over up to 4,096 timesteps, executing 4 small matmuls each, per block, per forward. With 32 blocks that's ~131k sequential kernel launches per chunk per mini-batch — on XPU each launch has fixed overhead, so the GPU sits idle. Worse: under autograd, every timestep's intermediate state (B, 128, 256, 64) (≈4 MB bf16) is retained for backward → 4,096 × 32 blocks ≈ hundreds of GB of activation memory for a single sequence. torch.compile cannot rescue this — the data-dependent while loop above it plus the token loop cause pervasive graph breaks and recompilations.
+
+What happens if not changed. If Issue 1 is fixed first, training will OOM immediately on any realistic sequence; on toy sizes it will run at seconds-per-token, making even one epoch take months.
+
+Alternative options. (a) Chunked SSD (Issue 1, Solution B); (b) drastically shorten chunk length and gradient-checkpoint every block; (c) use the official mamba-ssm kernels (not viable on XPU — CUDA-only); (d) swap the mixer for something with native parallel form (e.g., gated linear attention / RetNet-style, which have O(L) chunk-parallel PyTorch implementations).
+
+Solution A — chunked SSD (same as Issue 1B): parallel intra-chunk matmuls + inter-chunk recurrence. Memory for backward drops from O(L) states to O(L/chunk) states; compute becomes large dense matmuls that actually utilize the GPU.
+
+Solution B — checkpointed short-chunk fallback (stopgap):
+
+# keep the naive loop but:
+chunk_size = 256                       # instead of 4096
+for blk in self.blocks:
+    out, state = torch.utils.checkpoint.checkpoint(blk, hidden, state, use_reentrant=False)
+# and detach state across chunks (already done in the train loop)
+
+Explanation: gradient checkpointing discards intra-block activations and recomputes them in backward, capping memory at one block's worth; 256-token chunks bound the Python-loop length. This makes small-scale experiments possible (still slow) without rewriting the kernel.
+
+Recommended: Solution A. Solution B is only acceptable as a debugging stopgap while validating the loss/data pipeline at d_model=256. Any real training run needs the chunk-parallel scan; it's ~100 lines and well-documented in the Mamba2 literature.
+
+ISSUE 3 — 🔴 vocab_size=151643 is too small for Qwen2.5's special tokens
+
+Where: MambaJEPAEngine, ClosedLoopLatentDecoder, DualStageLatentDecoder (vocab_size=151643); inference_harness.py, GRPOLearningEngine.py
+
+Why it's an issue. Qwen2.5's tokenizer assigns = 151643, = 151644, = 151645, etc. The inference harness sets pad_token_id = eos_token_id (an ID ≥ 151643), then seeds generation with:
+
+gen_ids = torch.full((1, 1), self.tokenizer.pad_token_id, ...)  # id 151643+
+self.token_embedding(gen_ids)  # Embedding(151643, ...) → index out of range!
+
+nn.Embedding(151643, d) accepts indices 0–151642 only. Any special token — pad seed, EOS in training data, chat-template markers in the frontier traces — is out of bounds.
+
+What happens if not changed. IndexError: index out of range in self on the first decode step of inference and every GRPO rollout; intermittent crashes during training whenever a shard contains a special token (chat traces almost certainly do). The EOS-based stopping criterion is also unlearnable since EOS can't even be represented.
+
+Alternative options. (a) Enlarge the embedding tables; (b) remap/strip special tokens in the data pipeline and use a custom stop token; (c) switch to a tokenizer whose specials fit (fragile).
+
+Solution A — size vocab from the tokenizer (correct fix):
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+vocab = max(len(tokenizer), tokenizer.vocab_size)   # ≈ 151665; round up:
+vocab = ((vocab + 63) // 64) * 64                    # pad to multiple of 64 for GEMM efficiency
+model  = MambaJEPAEngine(vocab_size=vocab, ...)
+decoder = ClosedLoopLatentDecoder(vocab_size=vocab, ...)
+
+Explanation: derive the embedding size from the actual tokenizer at construction time instead of a hardcoded constant; padding to a multiple of 64 improves matmul throughput. Every ID the tokenizer can emit is now representable, including pad/EOS.
+
+Solution B — sanitize IDs at the data boundary:
+
+def sanitize(ids, vocab_size, unk_id):
+    return torch.where(ids >= vocab_size, torch.tensor(unk_id), ids)
+# apply in Dataset.__getitem__, in tokenizer wrapper for inference, and use a
+# dedicated in-vocab token (e.g., last ordinary id) as pad/eos everywhere.
+
+Explanation: clamp out-of-range IDs to a designated in-vocab token and standardize pad/EOS to in-range IDs. No architecture change, but you lose the semantics of chat-structure tokens and must keep the sanitizer in sync across 4 scripts.
+
+Recommended: Solution A. It's a two-line fix at construction, removes an entire class of crashes, and preserves special-token semantics that the chat-formatted training data depends on. Solution B is a leaky patch that must be replicated everywhere tokens enter the system.
+
+ISSUE 4 — 🔴 train_decoder.py latent-dimension mismatch (1024 data vs 5120 model)
+
+Where: train_decoder.py XPU path: model = ClosedLoopLatentDecoder() (default d_latent=5120) vs shard target_concept = BGE-M3 vectors (1024-d)
+
+Why it's an issue. The decoder's first layer is nn.Linear(5120, 16*6144). The dataset feeds it 1024-d BGE vectors:
+
+logits = model(decoder_input, target_concept)   # concept_to_memory(1024-d input into 5120-d Linear)
+
+What happens if not changed. RuntimeError: mat1 and mat2 shapes cannot be multiplied (N×1024 and 5120×98304) on the first mini-batch of every XPU run. (The CPU debug path "works" only because it happens to pass d_latent=1024.) There's also a conceptual mismatch: this script pretrains the decoder on raw BGE space, but train_latent_loop.py feeds it the engine's 5120-d hierarchical concept, so even a shape-fixed version pretrains against a different input distribution.
+
+Alternative options. (a) Pretrain on padded/projected BGE vectors; (b) pretrain only the micro slice and zero the macro slice; (c) skip decoder pretraining entirely and train jointly (the tripartite loss already trains the decoder).
+
+Solution A — micro-slice conditioning consistent with the hierarchy:
+
+model = ClosedLoopLatentDecoder(d_latent=5120)
+...
+bge = torch.stack(target_concepts_list)                 # (B, 1024)
+concept = torch.zeros(bge.size(0), 5120)
+concept[:, :1024] = bge                                  # micro slot = BGE; macro slot = 0
+logits = model(decoder_input, concept.to(device))
+
+Explanation: the main training loop aligns student_concept[:, :1024] to BGE and encourages the macro slice toward 0 via the energy-contraction penalty — so "BGE in the micro slot, zeros in macro" is exactly the distribution the decoder will later see early in joint training. Pretraining becomes consistent instead of contradictory.
+
+Solution B — drop the pretraining stage:
+
+# Delete train_decoder.py from the pipeline; rely on train_latent_loop.py,
+# optionally freezing the engine for the first N steps so the decoder
+# warm-starts against near-static concepts:
+if step < decoder_warmup_steps:
+    for p in engine.parameters(): p.requires_grad_(False)
+
+Explanation: since the decoder is trained end-to-end by the CE term anyway, a separate stage on a mismatched input distribution adds risk without clear benefit; freezing the engine briefly reproduces the "stable conditioning" benefit inside one script.
+
+Recommended: Solution A if you want the staged curriculum (cheap and now distributionally consistent); otherwise B for simplicity. Either way, add an assertion assert concept.size(-1) == model.concept_to_memory.in_features so this class of mismatch fails loudly with a clear message.
+
+ISSUE 5 — 🔴 DeepSpeed configuration cannot initialize (multi-model prepare, Windows, XPU, client optimizer + CPU offload)
+
+Where: train_latent_loop.py, train_rl_loop.py
+
+Why it's an issue. Four independent blockers stack:
+1. Two models, one Accelerator + DeepSpeed: accelerator.prepare(model, decoder, optimizer, ...) raises ValueError: You can't use same Accelerator() instance with multiple models when using DeepSpeed.
+2. Windows: paths (F:\JEPA_Model...) indicate Windows; DeepSpeed training — especially the DeepSpeedCPUAdam C++ op required by optimizer offload — does not build/run there.
+3. Client optimizer + ZeRO offload: you pass a vanilla torch.optim.AdamW; DeepSpeed's optimizer offload requires its own CPU Adam (ZeRO-Offload can only work with DeepSpeed optimizers), and Accelerate forces that check by default.
+4. XPU: stock DeepSpeed's accelerator abstraction for XPU is spotty; on one GPU, ZeRO-2's partitioning provides zero benefit anyway (there is nothing to shard across).
+
+What happens if not changed. Both training scripts terminate during setup — before any of the other bugs even get the chance to fire. If you ever "fix" enough to initialize, ZeRO-2 still keeps full gradients + fp32 master weights for a ~9B-param model, which cannot fit regardless (see Issue 12).
+
+Alternative options. (a) Remove DeepSpeed and manage memory manually; (b) wrap engine+decoder into one nn.Module and move to Linux/WSL2 with an XPU-enabled DeepSpeed build; (c) use FSDP (also awkward on single-GPU XPU); (d) use a paged/8-bit or CPU-offloaded optimizer without any distributed framework.
+
+Solution A — drop DeepSpeed; plain single-device loop with explicit accumulation:
+
+class FullModel(nn.Module):                      # single module = single state_dict, single prepare target
+    def __init__(self):
+        self.engine = MambaJEPAEngine(...)
+        self.decoder = ClosedLoopLatentDecoder(...)
+
+model = FullModel().to("xpu")
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9,0.95), weight_decay=0.1)
+
+for step, batch in enumerate(loader):
+    with torch.autocast("xpu", torch.bfloat16):
+        loss = compute_loss(model, batch) / ACCUM
+    loss.backward()
+    if (step + 1) % ACCUM == 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
+
+Explanation: on a single GPU, Accelerate+DeepSpeed adds failure modes and removes control while providing nothing you can't do in ten lines. You own the accumulation boundary, clipping, scheduler, and checkpoints — which also eliminates Issues 6 and 7 below.
+
+Solution B — keep Accelerate/DeepSpeed properly (Linux/WSL2 only):
+
+model = FullModel()                               # ONE module (fixes multi-model crash)
+# no client optimizer; let DeepSpeed create its own:
+ds_plugin = DeepSpeedPlugin(zero_stage=2, offload_optimizer_device="cpu",
+                            gradient_accumulation_steps=16, gradient_clipping=1.0)
+# in the ds config: optimizer: {type: "AdamW", params: {...}}  → DeepSpeedCPUAdam used internally
+model, dataloader, sched = accelerator.prepare(model, dataloader, sched)
+# training loop: ONLY accelerator.backward(loss); NO manual loss scaling; NO manual optimizer.step()
+with accelerator.accumulate(model):
+    loss = ...
+    accelerator.backward(loss)
+
+Explanation: fixes each blocker — single wrapped module, DeepSpeed-native offload optimizer, Linux runtime, and delegating accumulation entirely to the engine so there's exactly one stepping mechanism.
+
+Recommended: Solution A. Single GPU + XPU + (currently) Windows is precisely the environment DeepSpeed handles worst, and ZeRO's core value (sharding across ranks) is nil here. A manual loop is simpler, debuggable, and portable. Revisit DeepSpeed/FSDP only if you add GPUs.
+
+ISSUE 6 — 🟠 Checkpoint round-trip silently loads nothing (torch.compile prefixes + strict=False)
+
+Where: all scripts that save/load jepa_engine.pth / latent_decoder.pth
+
+Why it's an issue. Models are compiled (torch.compile) before load_state_dict(..., strict=False) and before saving. Compiled modules prefix every key with _orig_mod. (and Accelerate/DeepSpeed wrapping adds module.). So:
+- Saving writes mangled keys (_orig_mod.embedding.weight, ...).
+- Loading a plain checkpoint into a compiled model matches zero keys, and strict=False suppresses the error.
+- quantize_model.py loads with strict=True and will hard-crash on the mangled keys instead.
+
+What happens if not changed. Every stage of the pipeline logs "Successfully loaded ..." while actually running on random weights. The staged curriculum (decoder pretrain → latent loop → RL → inference) silently never composes; RL "fine-tunes" a random network; inference generates noise; you would burn weeks before noticing. This is the most dangerous failure mode in the repo because nothing crashes.
+
+Alternative options. (a) Save/load only unwrapped state dicts; (b) load before compiling; (c) strip prefixes on load; (d) never use strict=False for "should exist" checkpoints.
+
+Solution A — canonical save/load discipline:
+
+# SAVE (always unwrap):
+raw = accelerator.unwrap_model(model) if using_accelerate else getattr(model, "_orig_mod", model)
+torch.save(raw.state_dict(), path)
+
+# LOAD (before compile/wrap, strict, loud):
+model = FullModel()
+missing, unexpected = model.load_state_dict(torch.load(path, weights_only=True), strict=True)
+model = torch.compile(model)     # compile AFTER loading
+
+Explanation: state dicts always live in "plain module" key-space; compilation/wrapping happens strictly afterward; strict=True turns any drift into an immediate, explicit error instead of silent randomness.
+
+Solution B — defensive prefix-stripping loader (for existing mangled checkpoints):
+
+def clean_load(model, path):
+    sd = torch.load(path, weights_only=True)
+    sd = { k.removeprefix("module.").removeprefix("_orig_mod."): v for k, v in sd.items() }
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    loaded = len(sd) - len(unexpected)
+    assert loaded / max(len(model.state_dict()),1) > 0.99, \
+        f"Only {loaded} keys loaded; missing={missing[:5]} unexpected={unexpected[:5]}"
+
+Explanation: normalizes any historical checkpoint and — critically — converts "silent zero-key load" into an assertion failure with diagnostics, while still tolerating genuinely-new heads.
+
+Recommended: Both, in roles: Solution A as the permanent policy (it prevents the problem), Solution B as a one-time migration utility for checkpoints already on disk. The load-coverage assertion should stay forever; strict=False without a coverage check should be banned from the codebase.
+
+ISSUE 7 — 🟠 Gradient accumulation is triple-implemented and mutually conflicting
+
+Where: train_latent_loop.py
+
+Why it's an issue. Three mechanisms fight over the same job:
+1. Accelerator/DeepSpeedPlugin(gradient_accumulation_steps=16) — DeepSpeed scales losses by 1/16 internally and steps on its own count of backward() calls;
+2. manual scaling loss / (accumulation_steps * num_chunks) — dividing by 16 a second time (effective LR silently ~16× lower);
+3. manual optimizer.step() every 16 mini-batches — a no-op under DeepSpeed (the wrapped optimizer defers to the engine), while DeepSpeed's real step boundary lands wherever its backward-call counter says, which is decoupled from mini-batch boundaries because each mini-batch fires a variable number of backwards (one per 4096-token chunk).
+
+What happens if not changed. Even if the setup crashes of Issue 5 were resolved: double-scaled gradients, optimizer steps at arbitrary points mid-mini-batch, an LR scheduler stepping out of sync with actual updates, and gradient clipping applied to partial accumulations. Training would converge slowly, erratically, or not at all — with no error message ever.
+
+Alternative options. (a) One manual mechanism (with Issue 5A); (b) delegate fully to the framework (with Issue 5B); (c) treat each chunk backward as the accumulation unit rather than each mini-batch, since chunk count varies.
+
+Solution A — single manual mechanism, chunk-aware:
+
+ACCUM_TOKENS = 65536                       # accumulate by tokens, not by mini-batches
+tokens_seen = 0
+for chunk in chunks(batch):
+    loss = compute_loss(chunk) * (chunk.numel() / ACCUM_TOKENS)  # exact weighting, single scale
+    loss.backward()
+    tokens_seen += chunk.numel()
+    if tokens_seen >= ACCUM_TOKENS:
+        clip_(); opt.step(); sched.step(); opt.zero_grad(); tokens_seen = 0
+
+Explanation: because sequences have variable chunk counts, "divide by 16" mini-batch accounting is wrong anyway; token-weighted scaling makes every optimizer step correspond to a fixed effective batch in tokens, giving one unambiguous scale factor and step boundary.
+
+Solution B — full framework delegation:
+
+with accelerator.accumulate(model):
+    loss = compute_loss(...)               # NO manual division
+    accelerator.backward(loss)             # framework scales AND steps at the right boundary
+# remove all manual optimizer.step()/zero_grad(); step scheduler via accelerator sync flag:
+if accelerator.sync_gradients:
+    sched.step()
+
+Explanation: exactly one owner of accumulation. Works only after Issue 5B's restructuring (single module, DS-native optimizer), and note accumulate() counts forward/backward calls, so you must restructure so one call = one chunk with consistent semantics.
+
+Recommended: Solution A, paired with Issue 5's Solution A. Variable chunks-per-sample make framework accumulation counters semantically wrong here; explicit token-based accounting is the only version that is actually correct, not just non-crashing.
+
+ISSUE 8 — 🟠 GRPO reward is trivially hackable: empty output compiles
+
+Where: GRPOLearningEngine.compute_verifiable_reward
+
+Why it's an issue. rustc --crate-type=lib on an empty file (or a file containing only comments, or pub fn f(){}) exits 0. The reward is r_compile − γ·avg_loops with γ=0.01. The globally optimal policy is therefore: emit nothing (or a trivial item) and route with minimal loops → reward ≈ 1.0 every time, with far less variance than actually writing correct code. There is no term for relevance to the prompt, code length, tests passing, or even non-emptiness. Secondary problems: fixed temp filename grpo_eval_scratch.rs collides across concurrent processes; 5s timeout is tight for cold rustc on Windows; a random untrusted string is compiled on the host (rustc is mostly safe at compile-time, but include!/path tricks and proc-macro-adjacent surface deserve at least a sandbox/cwd jail).
+
+What happens if not changed. Classic reward hacking: within a few hundred GRPO steps the policy collapses to emitting empty/trivial compiling snippets. Group-relative advantages then go to ~0 (all rewards identical), σ gets clamped to 1e-6, and learning stalls permanently at the degenerate solution. Before collapse, early training has the opposite problem — a random-weight decoder never compiles anything, so all rewards equal −γ·loops, advantages ≈ router noise, and text-policy gradients are meaningless.
+
+Alternative options. (a) Richer verifier (compile and run unit tests); (b) shaped reward (compile + non-triviality + prompt-relevance terms); (c) curriculum: only enable RL after SFT reaches some compile-rate threshold; (d) reject-sampling/filtering instead of policy gradients.
+
+Solution A — test-based verifiable reward:
+
+def reward(prompt_meta, code):
+    src = code + "\n" + prompt_meta["test_harness"]     # e.g. #[cfg(test)] mod tests {...}
+    write(tmp_unique_file, src)                          # tempfile.mkstemp → no collisions
+    build = run(["rustc", "--test", tmp, "-o", exe], timeout=30)
+    if build.returncode != 0: return 0.0
+    tests = run([exe], timeout=10)                       # in a jailed temp cwd
+    if tests.returncode != 0: return 0.3                 # compiles but fails tests
+    return 1.0
+
+Explanation: pair each RL prompt with a small test harness (Magicoder-style instructions can be augmented, or start from datasets that ship tests). "Compiles" alone is nearly information-free for Rust libs; "passes tests" is a real verifiable signal and is not satisfied by empty output because the harness references the required items — empty code then fails to compile against the tests, closing the hack.
+
+Solution B — shaped anti-degenerate reward (no test data needed):
+
+def reward(prompt, code, global_steps):
+    if len(code.strip()) < MIN_CHARS:              return -0.5      # emptiness penalty
+    r_compile = 1.0 if compiles(code) else 0.0
+    r_struct  = 0.2 * min(1.0, count_items(code)/2)                 # fn/struct/impl present
+    r_rel     = 0.3 * cosine(bge(prompt), bge(code))                # reuses existing BGE model
+    return r_compile + r_struct + r_rel - 0.01*avg_loops
+
+Explanation: explicitly prices out the degenerate optimum (emptiness penalized, structure and prompt-relevance rewarded). Weaker than real tests — cosine relevance is gameable in principle — but implementable today with components already in the repo (BGE-M3 embedder).
+
+Recommended: Solution A, with Solution B's emptiness/min-length guard kept as a cheap belt-and-braces term. Verifiable-reward RL lives or dies on the verifier actually verifying the task; compile-only Rust rewards demonstrably don't. Also switch to tempfile and run the compiler in an isolated working directory regardless of which option you choose.
+
+ISSUE 9 — 🟠 GRPO re-evaluation log-probs are off by one → PPO ratios are garbage
+
+Where: GRPOLearningEngine.train_grpo_step, step 3
+
+Why it's an issue. During rollout, the log-prob stored for token tᵢ is computed from the decoder fed prefix [pad, t₀ … tᵢ₋₁] (logits at the last position predict tᵢ). During re-evaluation with gradients:
+
+logits = self.decoder(group_tokens[idx], student_concept)     # input: [t0 … t_{n-1}] — no pad seed!
+target_log_probs = log_probs.gather(-1, group_tokens[idx].unsqueeze(-1))  # gathers t_i at position i
+
+Position i of these logits is the prediction after seeing t₀…tᵢ — i.e., the model's probability of tᵢ₊₁. Gathering tᵢ there computes "probability of repeating the current token", not the rollout action's probability. So ratio = exp(new − old) compares two different random variables. Additionally, the whole thing runs inside the caller's autocast and PPO clipping then operates on noise.
+
+What happens if not changed. The policy-gradient signal is not merely noisy — it is systematically wrong (it reinforces token repetition patterns weighted by advantage). Combined with Issue 8's degenerate rewards, RL will actively damage whatever the SFT stage produced. No error is raised.
+
+Alternative options. (a) Fix the shift (input gen_ids[:, :-1], gather gen_ids[:, 1:]); (b) skip re-evaluation entirely and use the REINFORCE/GRPO form on rollout log-probs (requires gradient-enabled sampling); (c) mask post-EOS positions in the sum (currently every position counts).
+
+Solution A — correct teacher-forced re-scoring:
+
+full = torch.cat([pad_seed, group_tokens[idx]], dim=1)   # [pad, t0 … t_{n-1}]
+logits = decoder(full[:, :-1], student_concept)           # positions predict t0 … t_{n-1}
+logp   = F.log_softmax(logits.float(), dim=-1)            # fp32 for numerical stability
+new_lp = logp.gather(-1, group_tokens[idx].unsqueeze(-1)).squeeze(-1)   # aligned with rollout lp
+mask   = valid_token_mask(group_tokens[idx], eos_id)      # zero-out post-EOS
+ratio  = torch.exp((new_lp - old_lp) * mask)
+
+Explanation: reconstructs exactly the conditioning used at sampling time, so new_lp and old_lp are the same quantity under new vs. old parameters — which is what the PPO ratio requires by definition. The fp32 softmax and EOS mask remove two secondary corruption sources.
+
+Solution B — single-pass GRPO without re-evaluation:
+
+# sample WITH grad on the decoder pass (no torch.no_grad around decoding):
+for step in range(max_gen):
+    logits = decoder(gen_ids, concept.detach())
+    tok = sample(logits[:, -1])
+    lp_list.append(log_softmax(logits[:,-1]).gather(-1, tok))
+loss = -(advantage.detach() * torch.stack(lp_list).sum())  # REINFORCE w/ group-relative baseline
+
+Explanation: with exactly one gradient step per group, PPO's ratio is 1 anyway; the clipped-surrogate machinery buys nothing. Sampling with grad and applying the group-normalized advantage directly is the vanilla GRPO objective, eliminates the off-by-one risk structurally, and halves the forward passes. Cost: the sampling graph is kept in memory (bounded by max_gen=256 decoder-only passes; the engine stays under no_grad).
+
+Recommended: Solution A if you plan multiple inner epochs per group later (then clipping matters); Solution B for the current single-update design — it's simpler, cheaper, and immune to alignment bugs. Given this codebase's track record with index alignment, I'd pick B.
+
+ISSUE 10 — 🔴 Test-time GRPO weight updates in the inference harness ("AdaJEPA") are infeasible and destructive
+
+Where: inference_harness.py (self.optimizer = AdamW(engine+decoder params); on compile failure → train_grpo_step → loss.backward() → optimizer.step())
+
+Why it's an issue.
+- Memory: AdamW keeps two fp32 states per parameter. For this ~9B-param stack that's ~72 GB the moment optimizer.step() first runs — on an inference box.
+- Graph retention: train_grpo_step(group_size=2) returns the sum of two full policy graphs (engine forward + 256 decoder forwards each); backward through them will OOM long before the optimizer does.
+- Stability: one high-variance policy-gradient step from a group of two, driven by the hackable reward of Issue 8, permanently mutates production weights per failed request; the pipeline never re-saves nor rolls back, so weights drift within a session and reset between sessions — the worst of both worlds.
+- Mechanics: the models were compiled and set to eval(); train_grpo_step flips modes internally; dropout in train() during "inference-time learning" injects extra noise.
+
+What happens if not changed. First compilation failure → OOM crash; if it somehow fits (tiny debug model), the "adaptation" step degrades the model with near-random updates and every subsequent retry gets worse.
+
+Alternative options. (a) Remove TTT; rely on the existing error-message-in-prompt retry (already implemented!); (b) adapt only a tiny subset (e.g., LoRA/bias-only) with SGD, no optimizer state; (c) adapt an activation (the concept vector) instead of weights; (d) keep TTT offline as a batched fine-tune job, never in the request path.
+
+Solution A — delete weight updates; keep compiler-feedback retry:
+
+if result.returncode != 0:
+    current_prompt = f"{prompt}\n\nPrevious attempt failed to compile:\n{result.stderr[:2000]}\nFix the code."
+    continue          # that's it — no optimizer, no GRPO at inference
+
+Explanation: the harness already implements the effective mechanism (compiler-in-the-loop re-prompting). Removing the optimizer/GRPO objects also removes 72 GB of latent memory demand and all nondeterminism from serving.
+
+Solution B — latent-vector test-time optimization (if you want real adaptation):
+
+z = student_concept.detach().clone().requires_grad_(True)     # 5120 floats — the ONLY trainable thing
+opt = torch.optim.SGD([z], lr=0.05)
+for it in range(K):
+    ids = greedy_decode(decoder, z)                            # weights frozen, no dropout
+    r = compile_reward(ids)                                    # from Issue 8's verifier
+    if r == 1.0: break
+    # gradient-free or REINFORCE-style nudge on z:
+    loss = -r * seq_logprob(decoder, ids, z)
+    loss.backward(); opt.step(); opt.zero_grad()
+
+Explanation: optimizing the 5120-d concept vector is genuine test-time adaptation with a ~20 KB optimization state, zero risk to weights, per-request isolation, and it directly exploits the repo's own thesis (the concept vector is the plan). This is the principled version of what the "AdaJEPA" comment gestures at.
+
+Recommended: Solution A now — it's strictly safer and the retry loop already exists. Solution B is a worthwhile experiment later, but only after Issues 8/9 give it a non-degenerate reward and only behind a flag. Weight-mutating RL inside a request handler should not survive review in any form.
+
+ISSUE 11 — 🟡 "Adaptive compute" router never saves compute; routing outputs mostly unused; fragile in-place logits masking
+
+Where: MambaGraphRouter, Mamba2LatentLoop8B.forward
+
+Why it's an issue.
+- The loop while (global_steps < active_budget).any() and current_block_idx < self.num_blocks increments global_steps by ≤1 per block, and num_blocks=32 < max_budget=64, so with default budget the loop always runs all 32 blocks exactly once — the "dynamic budget" (min(64, max(8, len//64))) only bites when it drops below 32, i.e., only for short chunks, and then it truncates depth, skipping later blocks entirely (those blocks receive no gradient for such samples).
+- Every block computes fully for all tokens; the active_mask merely zeroes the residual add afterward. FLOPs are identical whether tokens have "halted" or not — the router spends parameters to save nothing.
+- The router emits num_blocks + 2 softmax outputs, but the num_blocks block-selection probabilities and the final -1 slot are never consumed — dead parameters and compute; only [:, :, -2] (halt) is read.
+- logits[:, :, :-2] = logits[...] * (1-mask) - mask*1e9 mutates a Linear output in place — legal here, but brittle (any future op that needs those pre-mutation values for backward triggers "variable modified by an inplace operation"), and -1e9 inside bf16 autocast flirts with overflow (bf16 max ≈ 3.4e38, fine, but fp16 would break).
+- Halting arithmetic mixes an ACT-style differentiable expected_steps with a hard non-differentiable global_steps += (unhalted_prob > 0.05), and it's expected_steps that gets returned as "global_steps" to losses/rewards — naming that already caused confusion in TripartiteLoss/GRPO.
+
+What happens if not changed. No crash — that's the problem. You pay full 32-block compute always, the router head trains toward an objective that can't change the compute, the "Dynamic Inference Budgeting" comment describes behavior the code doesn't have, and depth-truncation randomly under-trains late blocks. The architecture's headline feature is decorative.
+
+Alternative options. (a) True early-exit: break the loop when all tokens halt; (b) hard token-level skipping via gather/scatter of unhalted tokens (real FLOP savings, complex with SSM state); (c) remove the routers entirely and run a fixed-depth stack (honest baseline); (d) proper ACT (Graves-style) with the ponder cost as the route loss.
+
+Solution A — sequence-level early exit (simple, real savings):
+
+for blk_idx in range(self.num_blocks):
+    ... block forward, halting update ...
+    if (unhalted_prob < 0.05).all():        # every token halted
+        break                                # skip remaining blocks entirely
+    if blk_idx + 1 >= active_budget:         # budget = max DEPTH, redefine semantics
+        break
+# return expected_steps as `ponder_cost` (rename!), plus blocks_executed
+
+Explanation: minimal change; when the halting signal says "done", stop computing, don't just stop adding. Redefining active_budget as max depth makes the inference-time budget knob mean what the comment claims. Rename the second return to ponder_cost so the loss/reward code stops conflating it with executed steps.
+
+Solution B — remove adaptive routing (fixed depth) for v1:
+
+class Mamba2Stack(nn.Module):
+    def forward(self, h, states):
+        for blk, st in zip(self.blocks, states):
+            out, st = blk(h); h = h + out
+        return h, states
+# delete MambaGraphRouter, halting math, step/block embeddings, route loss & route reward terms
+
+Explanation: at the current stage (nothing has ever trained), each speculative mechanism multiplies debugging surface. A fixed-depth stack removes ~150 lines, the in-place hazard, the dead parameters, the depth-truncation bias, and two loss terms — and gives you a baseline against which adaptive compute can later be measured rather than assumed.
+
+Recommended: Solution B for now, with Solution A as the re-introduction path once the base model trains and you can A/B the ponder mechanism. Shipping unmeasured complexity is how this repo got here.
+
+ISSUE 12 — 🟡 Total parameter budget (~9–9.5B across engine + decoder) cannot train on the stated hardware
+
+Where: default dims — engine: d_model=6144, 32 SSD blocks (~5B) + 932M embedding + heads ≈ ~6B; decoder: 932M tied embedding + 503M concept_to_memory (5120→16·6144) + 4 decoder layers at d_model=6144 ≈ ~3.4B.
+
+Why it's an issue. bf16 weights ≈ 19 GB; bf16 grads ≈ 19 GB → ~38 GB before optimizer states or a single activation, versus ≤32 GB VRAM. ZeRO-2 on one GPU shards nothing; optimizer CPU-offload (if it worked — Issue 5) still leaves weights+grads on-device at 38 GB. Even Adam-on-CPU needs ~110 GB of system RAM for fp32 master weights + moments. And per Issue 2, the compute per token is enormous regardless.
+
+What happens if not changed. OOM at the first backward (or at optimizer init), on any configuration of this hardware. There is no flag combination in the current scripts that makes 6144×32 trainable on one 24–32 GB GPU.
+
+Alternative options. (a) Shrink to a size that fits with headroom (~1–1.5B total); (b) keep 8B-class ambitions but train with LoRA on a pretrained backbone instead of from scratch; (c) rent multi-GPU time for the large run and keep local hardware for development.
+
+Solution A — right-size the model (recommended defaults):
+
+ENGINE  = dict(d_model=2048, num_blocks=24, d_state=128, nheads=32)   # ≈ 0.9B
+DECODER = dict(d_model=1024, num_layers=6, n_frames=16)               # ≈ 0.35B incl. tied emb
+# bf16 weights ≈ 2.5GB, grads 2.5GB, 8-bit Adam ≈ 2.5GB → ~8GB + activations: fits with room
+
+Explanation: a ~1.2B total budget fits comfortably with 8-bit optimizer states and leaves VRAM for activations at real sequence lengths. Critically, at this scale you can actually iterate — every architectural hypothesis in this repo (hierarchical concepts, delta decoding, halting) is testable in days instead of never.
+
+Solution B — LoRA on a pretrained Mamba/hybrid backbone:
+
+base = load_pretrained("mamba2-2.7b" or similar)      # frozen, bf16 ≈ 5.4GB
+attach_lora(base, r=32, targets=["in_proj","out_proj"])   # ~50–100M trainable
+head = HierarchicalLatentProjectionHead(...)              # trainable
+decoder = ClosedLoopLatentDecoder(d_model=1024, ...)      # trainable
+# train JEPA alignment + decoder on top; skip from-scratch language acquisition entirely
+
+Explanation: the JEPA-alignment and latent-decoding ideas don't require pretraining language competence from zero — the single most expensive and least novel part of the plan. A pretrained backbone supplies syntax/semantics for free; your contribution (concept space + closed-loop decoder + verifier RL) trains on top with 100× less compute.
+
+Recommended: Solution B if a suitable pretrained checkpoint can run on XPU (kernel availability is the gating question — see prior discussion); otherwise Solution A. Under no circumstances keep d_model=6144, num_blocks=32 as the default constructor arguments on this hardware.
+
+ISSUE 13 — 🔴/🟡 quantize_model.py: dynamic INT8 is CPU-only, breaks weight tying, and produces unloadable artifacts
+
+Why it's an issue. (1) torch.ao.quantization.quantize_dynamic produces DynamicQuantizedLinear modules that execute on CPU (fbgemm/qnnpack) — they will not run on XPU, so the "9.7GB INT8 Inference" goal isn't met on the target device. (2) The decoder ties output_proj.weight = token_embedding.weight; quantization replaces the Linear with a packed INT8 copy while the embedding stays fp32 — tie silently broken, memory duplicated. (3) The saved q_*.pth state dicts contain packed-param structures loadable only into an already-quantized module graph, and no loader script exists. (4) It loads checkpoints strict=True, which per Issue 6 will fail on _orig_mod. keys. (5) fp32→int8 is a 75% reduction, not the claimed 50% (bf16→int8 is 50%) — cosmetic but symptomatic.
+
+What happens if not changed. Script crashes at load_state_dict today; if that's fixed, it emits artifacts that (a) nothing can load and (b) couldn't run on the XPU anyway.
+
+Solution A — weight-only INT8 for XPU via a supported path:
+
+# Option: torchao weight-only quant (device-agnostic dequant-on-the-fly), or IPEX's
+# ipex.llm/optimize INT8 path for XPU:
+from torchao.quantization import quantize_, Int8WeightOnlyConfig
+model = build_model(); clean_load(model, ckpt)          # Issue 6 loader
+quantize_(model, Int8WeightOnlyConfig())
+torch.save(model.state_dict(), "int8_engine.pt")        # plus a matching load script that
+                                                        # rebuilds + quantizes BEFORE loading
+
+Explanation: weight-only quantization keeps compute in bf16 with int8 storage, works on non-CUDA backends, and torchao's tensor-subclass state dicts round-trip. Ship the loader alongside the saver so the artifact is actually usable.
+
+Solution B — skip INT8; serve in bf16 at the right model size:
+Explanation: if Issue 12's resizing happens, a ~1.2B bf16 model is ~2.5 GB — quantization becomes an optimization, not a requirement. Delete this script until inference memory is actually the bottleneck, avoiding an entire toolchain risk on XPU.
+
+Recommended: Solution B now (the script solves a problem the resized model won't have), A later if serving at larger scale. Either way, fix or delete — a script that always crashes is worse than no script.
+
+ISSUE 14 — 🔴 Environment guards: hardcoded "xpu" autocast, unguarded torch.xpu / torch._inductor access, bnb import on non-CUDA
+
+Why it's an issue. Four small landmines:
+1. train_latent_loop.py uses torch.autocast(device_type="xpu", ...) unconditionally — the CPU fallback path it carefully builds can never execute (crash on non-XPU machines).
+2. hasattr(torch.xpu, 'empty_cache') / torch.xpu.is_available() — on older/CPU-only builds torch.xpu itself may not exist → AttributeError before hasattr helps.
+3. torch._inductor.config.freezing = True without import torch._inductor.config — module may not be loaded → AttributeError; also torch.compile+Inductor on XPU/Windows requires a working Triton-XPU, which is unverified here.
+4. import bitsandbytes as bnb at module top — on a CUDA-less box this import can fail/warn; in train_latent_loop.py it's dead code anyway; in train_decoder.py AdamW8bit requires CUDA kernels and will not work on XPU.
+
+What happens if not changed. Assorted crashes at import/setup time that vary by machine — the most annoying category to debug because "it works on my box."
+
+Solution A — one shared device/runtime module:
+
+# src/runtime.py
+def get_device():
+    if hasattr(torch, "xpu") and torch.xpu.is_available(): return torch.device("xpu")
+    if torch.cuda.is_available(): return torch.device("cuda")
+    return torch.device("cpu")
+
+def autocast_ctx(device):
+    if device.type == "cpu": return contextlib.nullcontext()
+    return torch.autocast(device.type, dtype=torch.bfloat16)
+
+def empty_cache(device):
+    mod = getattr(torch, device.type, None)
+    if mod and hasattr(mod, "empty_cache"): mod.empty_cache()
+
+def maybe_compile(m, device):
+    if device.type != "xpu": return m
+    try:
+        import torch._inductor.config as cfg
+        cfg.freezing = True
+        return torch.compile(m, backend="inductor")
+    except Exception as e:
+        logging.warning(f"compile disabled: {e}"); return m
+
+Explanation: every script imports these four helpers; device-specific logic exists in exactly one guarded place, and torch.compile failure degrades to eager instead of crashing.
+
+Solution B — per-script guards: wrap each risky access in try/except where it occurs. Explanation: no refactor, but the same guard logic gets copy-pasted into six files and will drift (that drift is literally how the hardcoded "xpu" autocast bug happened — other scripts have the conditional version).
+
+Recommended: Solution A. The bug pattern already demonstrates why duplication fails here. Also delete the bnb import from train_latent_loop.py/train_rl_loop.py, and in train_decoder.py replace AdamW8bit with plain AdamW (fine at the Issue-12 model size) or a torchao 8-bit optimizer if XPU-supported.
+
+ISSUE 15 — 🟠 ignore_index=0 masks a real Qwen token; pad/vocab conventions inconsistent
+
+Why it's an issue. CrossEntropyLoss(ignore_index=0) plus pad_sequence(padding_value=0) treats token ID 0 as padding. In Qwen's vocabulary, ID 0 is a real token (!). Every legitimate occurrence of it in targets is silently dropped from the loss; conversely, if pad were later set to eos_token_id (as the inference harness does), padding would not be ignored. The convention differs across scripts.
+
+What happens if not changed. Small persistent label corruption (model never learns ! — noticeable in code, e.g. !=, !important, macros like println!), and a latent booby trap when pad conventions change.
+
+Solution A — dedicated pad ID, threaded everywhere:
+
+PAD_ID = tokenizer.pad_token_id            # 151643 after Issue 3's vocab fix
+pad_sequence(..., padding_value=PAD_ID)
+nn.CrossEntropyLoss(ignore_index=PAD_ID)
+
+Solution B — explicit attention/loss mask, ignore_index unused:
+
+mask = (targets != PAD_ID)
+loss = (F.cross_entropy(logits.transpose(1,2), targets, reduction="none") * mask).sum() / mask.sum()
+
+Explanation: A is the idiomatic fix once Issue 3 makes the real pad ID representable; B additionally gives you the mask object to reuse for the decoder's padding-attention (currently padded positions also attend freely — a lesser cousin of this bug) and for correct mean-pooling in Issue 16.
+
+Recommended: B, because the same mask fixes three problems (loss, pooling, attention) with one artifact.
+
+ISSUE 16 — 🟡 Concept pooling and JEPA targets are misaligned (pads pooled in; per-chunk student vs whole-sequence teacher)
+
+Why it's an issue. HierarchicalLatentProjectionHead does x.mean(dim=1) over all positions — including padding, so batch composition changes the concept vector. Separately, in train_latent_loop.py every 4096-token chunk's concept is pulled toward the same BGE embedding of the entire sequence: chunk 1's representation is regressed onto an embedding of text it hasn't seen, injecting irreducible noise into l_jepa. Also the sigmoid gate at T=0.1 saturates (gradients ≈ 0 almost everywhere), so the macro gate mostly freezes at its initialization.
+
+What happens if not changed. The JEPA alignment term — the project's central idea — trains against an inconsistent target with pad-dependent inputs; the macro gate likely never learns to open (energy penalty pushes it to 0, saturated sigmoid can't push back). No crash; just a quietly weakened core objective.
+
+Solution A — masked pooling + per-chunk targets:
+
+pooled = (x * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True)   # pad-free pooling
+# offline: precompute BGE embedding PER 4096-token chunk during shard building:
+item = {"input_tokens": ..., "target_concepts": [bge(chunk_i) for chunk_i in chunks]}
+# train: align chunk i's student concept to target_concepts[i]
+
+Solution B — align only the final chunk:
+
+apply_jepa = (t + chunk_size >= seq_len)         # last chunk only
+loss = l_ce + (lambda_jepa * l_jepa if apply_jepa else 0) + ...
+
+Explanation: A gives dense, correctly-matched supervision (best signal, requires re-sharding data); B is a two-line change that at least stops training early chunks toward unseen content, at the cost of sparser JEPA signal. For the gate, raise T to ~1.0 (or use a straight-through hard gate) in either case.
+
+Recommended: A — the shards must be regenerated anyway once Issues 3/15 change tokenization conventions, so add per-chunk targets in the same pass.
+
+ISSUE 17 — ⚪ Scheduler & λ_jepa accounting miscalibrated
+
+Why/impact. total_steps = len(dataloader) * epochs counts files, but the scheduler steps once per 16 mini-batches (many mini-batches per file) → cosine schedule length off by a large data-dependent factor; get_lambda_jepa reads lr_scheduler.last_epoch through Accelerate's wrapper (attribute forwarding not guaranteed) with its own hardcoded warmup_steps=1000 disconnected from the 5% LR warmup. Result: LR decays to ~0 long before (or after) training ends; λ ramp is arbitrary.
+Solutions. (A) Maintain your own opt_steps counter incremented exactly where optimizer.step() runs; compute total_opt_steps from a pre-scan of shard item counts (sum(len(load(f)) for f in files) // (mini_bs*ACCUM) * epochs); drive both LR and λ from that one counter. (B) Switch to step-count-free schedules: constant LR + ReduceLROnPlateau on CE, and λ_jepa ramped by tokens-seen.
+Recommended: A — a single authoritative step counter is trivial and fixes both consumers; plateau schedules interact badly with multi-term losses.
+
+ISSUE 18 — ⚪ train_rl_loop.py blanket except Exception swallows everything
+
+Why/impact. Every step is wrapped in except Exception as e: logging.error(...) and continues — so the DeepSpeed crash (Issue 5), OOMs, and the embedding IndexError (Issue 3) each become an infinite scroll of error logs at 100% failure rate, checkpointing nothing forever. Also: optimizer.zero_grad() then backward then immediate step() every iteration contradicts the configured gradient_accumulation_steps=16; and train_grpo_step's unused optimizer argument hides the fact that stepping responsibility is ambiguous.
+Solutions. (A) Catch only expected, recoverable exceptions with a failure budget:
+
+except (TokenizationError, RewardTimeout) as e:
+    fail += 1; logging.warning(...)
+    if fail > 20 and fail/max(step,1) > 0.5: raise RuntimeError("RL loop persistently failing")
+
+(B) No catch at all; rely on checkpoint-resume for crash recovery. Recommended: A — RL loops do hit flaky per-sample errors (compiler timeouts), but systemic failure must terminate the run loudly.
+
+ISSUE 19 — ⚪ Assorted smaller defects (grouped)
+
+#	Defect	Consequence	Fix options (pick 1st unless noted)
+19a	Conv1d left-context not carried across chunks (only SSM state is passed)	boundary artifacts every 4096 tokens	(1) carry last k-1=3 inputs per block as conv state; (2) overlap chunks by 3 tokens
+19b	Decoder generation has no KV cache; full prefix re-encoded per token	O(n²) decode; GRPO rollouts crawl	(1) implement KV-cached decoder layers; (2) accept for 256-token cap, fix before raising max_seq_len
+19c	max_seq_len=256 decoder cap	most real code answers truncated; EOS never seen → run to cap always	(1) raise to 1024+ after 19b; (2) train on ≤256-token targets only (limits usefulness)
+19d	Rollout seeds decoder with pad token; SFT teacher-forcing starts with a real token	train/inference conditioning mismatch at position 0	(1) prepend a BOS (or pad) during SFT decoder input too; (2) seed inference with first target-distribution token
+19e	hidden_state = torch.zeros(..., dtype=tokens.dtype) fallback in Mamba2LatentLoop8B creates a long tensor if called without embeddings	crash/nonsense if that path is ever used	(1) dtype=self.embedding_global.weight.dtype; (2) remove the fallback and require embeddings
+19f	Fixed reward temp filename grpo_eval_scratch.rs	collisions across concurrent runs	(1) tempfile.NamedTemporaryFile in a per-run temp dir; (2) filename with PID+uuid
+19g	rewards.std() with group_size=1..2 unstable; clamp to 1e-6 explodes advantages when rewards nearly tie	huge-magnitude spurious gradients	(1) advantage = reward − mean (no σ division), per original GRPO option; (2) clamp σ from below at e.g. 0.1
+19h	JEPA dataloader shuffle=False	ordered shards → correlated batches, curriculum accidents	(1) shuffle=True at file level + shuffle items within chunk; (2) pre-shuffled shard build
+19i	l_energy_contraction added to loss but never logged/returned	can't tell if the macro gate mechanism does anything	(1) return & log it; (2) fold into l_route reporting
+19j	pin_memory=True targets CUDA by default	no-op (or warning) on XPU	(1) pin_memory_device="xpu" if supported; (2) drop it
+19k	Random active_budget via torch.rand inside forward	nondeterminism, torch.compile guard churn, DS graph instability	(1) sample budget in the training loop and pass it in; (2) fixed budget schedule per epoch
+19l	Router logits masked in place (logits[:, :, :-2] = ...)	fragile under autograd changes; moot if Issue 11B removes router	(1) build mask additively: logits = logits + additive_mask (out-of-place); (2) torch.where
+19m	CSV header order (CE, JEPA, Route, Total) vs row write order matches, but per-chunk averages divide multi-chunk stats by num_chunks while single-chunk minibatches dominate	mildly misleading metrics	(1) log per-token means; (2) log raw sums + counts
+
+Consolidated recommendation & fix order
+
+The repo currently has five independent "cannot run at all" failures (Issues 1, 3, 4, 5, 14) layered over four "runs but trains on garbage" failures (6, 7, 8, 9), on top of a hardware-infeasible default scale (2, 12). The efficient path out:
+
+1. Simplify the substrate first — Issue 5A (drop DeepSpeed, single FullModel), Issue 14A (runtime helpers), Issue 11B (remove routing for v1), Issue 12A/B (right-size or pretrained backbone). This deletes more bugs than it fixes.
+2. Make the model mathematically runnable — Issue 1B + 2A (chunked SSD with a unit test vs. the naive loop), Issue 3A (vocab from tokenizer), Issue 19e.
+3. Make training trustworthy — Issue 6A (checkpoint discipline + coverage assert), 7A (token-based accumulation), 15B (explicit masks), 16A (per-chunk targets), 17A (single step counter). Regenerate shards once, incorporating 3/15/16.
+4. Only then touch RL — Issue 8A (test-based rewards), 9B (single-pass GRPO), 18A, 19f/g. RL amplifies whatever the verifier and the log-probs actually say; both are currently wrong.
+5. Delete the inference-time weight updates (Issue 10A) and the quantization script (13B) until there's a trained model worth serving.
+
+A useful discipline going forward: every mechanism with a paper-style name in the comments should ship with (a) a shape-checked unit test and (b) an ablation flag that turns it off. Several of the arXiv IDs cited in the comments don't correspond to real papers, and nearly every one of those "NEW:" blocks contains one of the bugs above — that correlation is the real finding of this review.
+
+--- Gemini Reply ---
+Fable 5 is the strict, uncompromising Senior Staff Engineer we desperately needed to look over our code. Let's break down exactly why it is right, and how we are going to fix this.
+
+### 1. The Catastrophic Math Errors (Issues 1, 3, & 4)
+
+We built a highly complex theoretical engine, but the basic PyTorch plumbing is broken.
+
+* **The Shape Mismatch:** In `Mamba2SSDBlock`, we initialized the state as `(256, 256)` but mathematically tried to update it with an outer product of `(256, 64)`. Fable 5 is mathematically correct; the very first token passed into your `inference_harness_6.py` will trigger a hard crash.
+* **The Decoder Mismatch:** We expanded your engine's output to a hierarchical 5120 dimensions, but `train_decoder_7.py` is still trying to feed it the raw 1024D `bge-m3` vectors. Matrix multiplication will fail instantly.
+* **The Qwen Vocab:** Qwen 2.5 uses special tokens (like `<|im_start|>`) that go up to ID 151665. Setting our embedding table to exactly `151643` means any chat-formatted dataset shard will throw an index out-of-bounds error.
+
+### 2. The Hardware Realities (Issues 2 & 5)
+
+Fable 5 perfectly diagnosed the limitations of our local environment.
+
+* **The Python Recurrence Loop:** Looping over 4096 tokens in pure Python (`for t in range(seq_len):`) forces the autograd engine to save hundreds of gigabytes of activation memory. Even if the tensor shapes were right, it would bring your system to a grinding halt. We need a parallelized, chunked scan.
+* **DeepSpeed on Windows/XPU:** Trying to run DeepSpeed ZeRO-2 CPU-offload across a Windows/Linux subsystem bridge targeting an Intel Arc GPU is an integration nightmare. DeepSpeed relies on custom C++ `CPUAdam` ops that routinely fail to compile or execute in this environment.
+
+### The Rebuild Strategy
+
+We need to swallow our pride, accept Fable 5's "Consolidated fix order," and strip this architecture back to a fundamentally sound, executable foundation before we add the advanced routing logic back in.
+
+Here are the immediate, raw PyTorch fixes for the most critical bugs to stabilize your codebase.
+
+**Fix 1: The Shape Mismatch & Vocab Size (`model_architecture_7.py`)**
+We must correctly size the vocabulary and fix the continuous state tensor dimensions.
+
+```python
+# In MambaJEPAEngine and ClosedLoopLatentDecoder, update the default vocab:
+# Pad to the nearest multiple of 64 for GEMM efficiency
+def __init__(self, vocab_size=151680, ...):
+
+# In Mamba2SSDBlock, fix the state initialization:
+if mamba_state is None:
+    # Corrected shape: (batch, nheads, d_state, d_head)
+    mamba_state = torch.zeros(
+        batch, self.nheads, self.d_state, self.d_head, 
+        device=x.device, dtype=x.dtype
+    )
+
+# In Mamba2SSDBlock, fix the state update math:
+# mamba_state = decay * mamba_state + dt_t * torch.matmul(B_t, act_t)
+mamba_state = decay * mamba_state + dt_t * (B_t @ act_t) 
+out_t = (C_t @ mamba_state).squeeze(-2)
+
+```
+
+**Fix 2: The Decoder Conditioning Mismatch (`train_decoder_7.py`)**
+We must ensure the decoder pre-training receives the exact 5120D hierarchical tensor shape that the engine will eventually output.
+
+```python
+# Around line 105, pad the 1024D BGE-M3 target into a 5120D tensor:
+bge_targets = torch.stack(target_concepts_list).to(device) # (Batch, 1024)
+target_concept = torch.zeros(bge_targets.size(0), model.concept_to_memory.in_features, device=device, dtype=bge_targets.dtype)
+target_concept[:, :1024] = bge_targets
+
+logits = model(decoder_input, target_concept)
+
+```
+
+**Fix 3: Dropping DeepSpeed for Manual Accumulation (`train_latent_loop_7.py`)**
+We will remove the brittle `DeepSpeedPlugin` and `Accelerator` wrapping, and rely on a rock-solid manual gradient accumulation loop using standard PyTorch.
+
+```python
+# Remove DeepSpeed imports and accelerator setup. 
+# Manage the loop natively:
+optimizer.zero_grad()
+ACCUM_STEPS = 16
+
+for step, batch in enumerate(dataloader):
+    with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
+        loss = compute_loss(...) / ACCUM_STEPS
+        
+    loss.backward()
+    
+    if (step + 1) % ACCUM_STEPS == 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+
+```
