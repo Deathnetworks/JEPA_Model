@@ -22,18 +22,36 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 
-def stream_rl_prompts(dataset_name="ise-uiuc/Magicoder-OSS-Instruct-75K", start_idx=0):
+def stream_rl_prompts(dataset_name="bigcode/humanevalpack", start_idx=0):
     """
-    Streams multi-language RL prompts.
+    Streams multi-language RL prompts across all 6 languages.
     """
-    dataset = load_dataset(dataset_name, split="train", streaming=True)
+    from datasets import interleave_datasets
+
+    languages = ['python', 'cpp', 'js', 'java', 'go', 'rust']
+    datasets = []
+
+    for lang in languages:
+        try:
+            ds = load_dataset(dataset_name, lang, split="train", streaming=True)
+            # Tag each language so the engine knows how to compile/run the test harness
+            ds = ds.map(lambda x: {**x, '_lang': lang})
+            datasets.append(ds)
+        except Exception as e:
+            logging.warning(f"Could not load language {lang}: {e}")
+
+    if not datasets:
+        return
+
+    dataset = interleave_datasets(datasets)
     dataset = dataset.skip(start_idx)
+
     for row in dataset:
-        yield row['instruction']
+        yield row['instruction'], row['test'], row['_lang']
 
 def train_rl_loop(
     epochs: int = 1,
-    dataset_name: str = "ise-uiuc/Magicoder-OSS-Instruct-75K",
+    dataset_name: str = "bigcode/humanevalpack",
     group_size: int = 4,
     learning_rate: float = 1e-5,
     engine_path: str = "jepa_engine.pth",
@@ -50,27 +68,28 @@ def train_rl_loop(
             tokenizer.pad_token_id = tokenizer.eos_token_id
         else:
             tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    vocab_size = ((len(tokenizer) + 63) // 64) * 64
 
     logging.info("Instantiating MambaJEPAEngine and ClosedLoopLatentDecoder...")
     if device.type == 'cpu':
         logging.warning("Running on CPU, using heavily downgraded hyperparameters to avoid OOM.")
-        model = MambaJEPAEngine(d_model=64, num_blocks=2, max_budget=2, d_latent=1024)
-        decoder = ClosedLoopLatentDecoder(d_model=64, d_latent=1024)
+        model = MambaJEPAEngine(vocab_size=vocab_size, d_model=64, num_blocks=2, max_budget=2, d_latent=1024)
+        decoder = ClosedLoopLatentDecoder(vocab_size=vocab_size, d_model=64, d_latent=1024)
     else:
-        model = MambaJEPAEngine()
-        decoder = ClosedLoopLatentDecoder()
+        model = MambaJEPAEngine(vocab_size=vocab_size)
+        decoder = ClosedLoopLatentDecoder(vocab_size=vocab_size)
 
 
 
     logging.info(f"Loading weights from {engine_path} and {decoder_path}...")
     try:
-        model.load_state_dict(torch.load(engine_path, map_location=device, weights_only=True), strict=True)
+        from src.checkpoint import load_ckpt; load_ckpt(model, engine_path, device)
         logging.info(f"Successfully loaded {engine_path}")
     except FileNotFoundError:
         logging.warning(f"Could not find {engine_path}, initializing with random weights.")
 
     try:
-        decoder.load_state_dict(torch.load(decoder_path, map_location=device, weights_only=True), strict=True)
+        load_ckpt(decoder, decoder_path, device)
         logging.info(f"Successfully loaded {decoder_path}")
     except FileNotFoundError:
         logging.warning(f"Could not find {decoder_path}, initializing with random weights.")
@@ -84,15 +103,35 @@ def train_rl_loop(
     model = model.to(device)
     decoder = decoder.to(device)
 
-    optimizer_grouped_parameters = [
-        {"params": [p for n, p in model.named_parameters() if p.requires_grad]},
-        {"params": [p for n, p in decoder.named_parameters() if p.requires_grad]}
+    import bitsandbytes as bnb
+    from galore_torch import GaLoreAdamW8bit
+
+    galore_params = []
+    non_galore_params = []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if isinstance(model.get_submodule(n.rsplit('.', 1)[0] if '.' in n else ''), nn.Linear):
+            galore_params.append(p)
+        else:
+            non_galore_params.append(p)
+
+    for n, p in decoder.named_parameters():
+        if not p.requires_grad:
+            continue
+        if isinstance(decoder.get_submodule(n.rsplit('.', 1)[0] if '.' in n else ''), nn.Linear):
+            galore_params.append(p)
+        else:
+            non_galore_params.append(p)
+
+    param_groups = [
+        {'params': non_galore_params},
+        {'params': galore_params, 'rank': 128, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
     ]
 
-    # --- UPGRADE: Replace 8-bit Adam with standard AdamW ---
-    # Because ZeRO-2 offloads this to System RAM, we no longer need VRAM quantization here.
-    optimizer = optim.AdamW(
-        optimizer_grouped_parameters,
+    optimizer = bnb.optim.PagedAdamW8bit(
+        param_groups,
+
         lr=learning_rate,
         betas=(0.9, 0.95),
         weight_decay=0.1
@@ -120,14 +159,13 @@ def train_rl_loop(
 
         step_idx = starting_step if epoch == starting_epoch else 0
 
-        for prompt in prompt_generator:
+        optimizer.zero_grad(set_to_none=True)
+        for prompt, test_harness, lang in prompt_generator:
             try:
                 inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-                optimizer.zero_grad()
-
                 with torch.autocast(**get_autocast_kwargs()):
-                    loss = grpo_engine.train_grpo_step(inputs["input_ids"], optimizer, group_size=group_size)
+                    loss = grpo_engine.train_grpo_step(inputs["input_ids"], test_harness, lang, optimizer, group_size=group_size)
 
                 loss_scaled = loss / 16
                 loss_scaled.backward()
@@ -155,15 +193,15 @@ def train_rl_loop(
 
     if True:
         raw_model = getattr(model, "_orig_mod", model)
-        torch.save(raw_model.state_dict(), "jepa_engine_rl.pth")
+        from src.checkpoint import save_ckpt; save_ckpt(raw_model, "jepa_engine_rl.pth")
         raw_decoder = getattr(decoder, "_orig_mod", decoder)
-        torch.save(raw_decoder.state_dict(), "latent_decoder_rl.pth")
+        save_ckpt(raw_decoder, "latent_decoder_rl.pth")
         logging.info("Models saved.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--dataset", type=str, default="ise-uiuc/Magicoder-OSS-Instruct-75K")
+    parser.add_argument("--dataset", type=str, default="bigcode/humanevalpack")
     parser.add_argument("--group_size", type=int, default=4)
     args = parser.parse_args()
     train_rl_loop(epochs=args.epochs, dataset_name=args.dataset, group_size=args.group_size)
