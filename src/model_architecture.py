@@ -242,8 +242,11 @@ class HierarchicalLatentProjectionHead(nn.Module):
             nn.Linear(128, 1)
         )
 
-    def forward(self, x):
-        pooled = x.mean(dim=1)
+    def forward(self, x, attention_mask=None):
+        if attention_mask is not None:
+            pooled = (x * attention_mask.unsqueeze(-1)).sum(dim=1) / attention_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        else:
+            pooled = x.mean(dim=1)
         micro_concept = self.micro_proj(pooled)
         
         # UPGRADE: Temperature Scaled Sigmoid (T=0.1) for a strict On/Off boundary
@@ -272,7 +275,7 @@ class MambaJEPAEngine(nn.Module):
         )
         self.max_budget = max_budget
 
-    def forward(self, input_tokens, mamba_state=None, active_budget=None):
+    def forward(self, input_tokens, mamba_state=None, active_budget=None, attention_mask=None):
         hidden_state = self.embedding(input_tokens)
         
         if active_budget is None:
@@ -288,7 +291,7 @@ class MambaJEPAEngine(nn.Module):
             active_budget=active_budget
         )
 
-        student_concept = self.projection_head(hidden_state)
+        student_concept = self.projection_head(hidden_state, attention_mask=attention_mask)
 
         # Note: We do NOT alter the return signature to prevent breaking train_latent_loop.py unpacking.
         # The foresight head will be invoked sequentially during the GRPO phase.
