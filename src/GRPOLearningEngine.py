@@ -1,3 +1,4 @@
+import tempfile
 import os
 import re
 import sys
@@ -19,60 +20,40 @@ class GRPOLearningEngine:
         if len(text_output.strip()) < 10:
             return -0.5
 
-        bt = chr(96) * 3
-        pattern = rf"{bt}(?:{lang})?\n(.*?){bt}"
-        
-        match = re.search(pattern, text_output, re.DOTALL | re.IGNORECASE)
+        FENCE_REGEX = re.compile(r"```(?:[a-zA-Z0-9_+\-]*)\s*\n(.*?)```", re.DOTALL)
+        match = FENCE_REGEX.search(text_output)
         extracted_code = match.group(1).strip() if match else text_output.strip()
 
-        import tempfile
-        import subprocess
 
-        # Define extensions and build/run commands by language
         lang_config = {
-            'python': {'ext': '.py', 'build': None, 'run': ['python', '{file}']},
-            'cpp': {'ext': '.cpp', 'build': ['g++', '-std=c++17', '{file}', '-o', '{file}.exe'], 'run': ['./{file}.exe']},
-            'js': {'ext': '.js', 'build': None, 'run': ['node', '{file}']},
-            'java': {'ext': '.java', 'build': ['javac', '{file}'], 'run': ['java', '{file}']},
-            'go': {'ext': '.go', 'build': ['go', 'build', '-o', '{file}.exe', '{file}'], 'run': ['./{file}.exe']},
-            'rust': {'ext': '.rs', 'build': ['rustc', '--test', '{file}', '-o', '{file}.exe'], 'run': ['./{file}.exe']}
+            'python': {'ext': '.py', 'build': None, 'run': lambda p: ['python', p]},
+            'cpp': {'ext': '.cpp', 'build': lambda p: ['g++', '-std=c++17', p, '-o', f"{p}.exe"], 'run': lambda p: [f"{p}.exe"]},
+            'js': {'ext': '.js', 'build': None, 'run': lambda p: ['node', p]},
+            'java': {'ext': '.java', 'build': lambda p: ['javac', p], 'run': lambda p: ['java', os.path.splitext(os.path.basename(p))[0]]},
+            'go': {'ext': '.go', 'build': lambda p: ['go', 'build', '-o', f"{p}.exe", p], 'run': lambda p: [f"{p}.exe"]},
+            'rust': {'ext': '.rs', 'build': lambda p: ['rustc', '--test', p, '-o', f"{p}.exe"], 'run': lambda p: [f"{p}.exe"]}
         }
         
-        cfg = lang_config.get(lang, lang_config['python'])
+        cfg = lang_config.get(lang, lang_config['rust'])
 
-        with tempfile.NamedTemporaryFile(suffix=cfg['ext'], delete=False) as temp_file:
-            full_code = f"{extracted_code}\n\n{test_harness_string}"
-            temp_file.write(full_code.encode('utf-8'))
-            temp_path = temp_file.name
-            
-        r_compile = 0.0
-        try:
-            if cfg['build']:
-                build_cmd = [part.format(file=temp_path) for part in cfg['build']]
-                build = subprocess.run(build_cmd, timeout=15, capture_output=True)
-                if build.returncode != 0:
-                    r_compile = 0.0
-                else:
-                    run_cmd = [part.format(file=temp_path) for part in cfg['run']]
-                    tests = subprocess.run(run_cmd, timeout=10, capture_output=True)
-                    r_compile = 1.0 if tests.returncode == 0 else 0.3
-            else:
-                run_cmd = [part.format(file=temp_path) for part in cfg['run']]
-                tests = subprocess.run(run_cmd, timeout=10, capture_output=True)
-                r_compile = 1.0 if tests.returncode == 0 else 0.0
-        except Exception:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_file = os.path.join(temp_dir, f"solution{cfg['ext']}")
+            with open(source_file, "w", encoding="utf-8") as tf:
+                tf.write(f"{extracted_code}\n\n{test_harness_string}")
+
             r_compile = 0.0
-        finally:
-            if os.path.exists(temp_path):
-                try: os.remove(temp_path)
-                except: pass
-            if os.path.exists(f"{temp_path}.exe"):
-                try: os.remove(f"{temp_path}.exe")
-                except: pass
-            if lang == 'java' and os.path.exists(temp_path.replace('.java', '.class')):
-                try: os.remove(temp_path.replace('.java', '.class'))
-                except: pass
+            try:
+                if cfg['build']:
+                    build_res = subprocess.run(cfg['build'](source_file), timeout=15, capture_output=True)
+                    if build_res.returncode != 0:
+                        return 0.0
 
+                run_res = subprocess.run(cfg['run'](source_file), timeout=10, capture_output=True, cwd=temp_dir)
+                r_compile = 1.0 if run_res.returncode == 0 else 0.3
+            except subprocess.TimeoutExpired:
+                return -0.2
+            except Exception:
+                r_compile = 0.0
         avg_loops = global_steps.float().mean().item()
         reward = r_compile - (self.gamma * avg_loops)
         return reward
@@ -97,8 +78,8 @@ class GRPOLearningEngine:
         self.decoder.train()
 
         for _ in range(group_size):
-            # Remove no_grad so we sample with gradients enabled directly
-            student_concept, global_steps, _ = self.model(prompt_tokens)
+            with torch.no_grad():
+                student_concept, global_steps, _ = self.model(prompt_tokens)
 
             gen_ids = torch.full((1, 1), self.tokenizer.pad_token_id, dtype=torch.long, device=device)
             log_probs_sampled = []
@@ -138,10 +119,7 @@ class GRPOLearningEngine:
             log_probs_sum = group_log_probs[idx].sum()
             loss = -(log_probs_sum * advantages[idx])
             
-            # Router policy
-            route_ratio = group_rollout_steps[idx] / (group_rollout_steps[idx].detach() + 1e-8)
-            l_route_policy = -(route_ratio * advantages[idx]).mean()
-            
-            total_loss += loss + l_route_policy
+            total_loss += loss
+
 
         return total_loss
