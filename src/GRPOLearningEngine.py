@@ -15,44 +15,69 @@ class GRPOLearningEngine:
         self.gamma = gamma          # Computational step penalty scale factor
         self.clip_eps = clip_eps    # PPO-style policy clipping bounds
 
-    def compute_verifiable_reward(self, text_output, global_steps):
-        """
-        Executes a deterministic verification check via rustc.
-        """
-        # Bypasses markdown parser collisions by constructing the backtick delimiter dynamically via chr(96)
+    def compute_verifiable_reward(self, text_output, test_harness_string, lang, global_steps):
+        if len(text_output.strip()) < 10:
+            return -0.5
+
         bt = chr(96) * 3
-        pattern = rf"{bt}(?:rust)?\n(.*?){bt}"
+        pattern = rf"{bt}(?:{lang})?\n(.*?){bt}"
         
         match = re.search(pattern, text_output, re.DOTALL | re.IGNORECASE)
         extracted_code = match.group(1).strip() if match else text_output.strip()
+
+        import tempfile
+        import subprocess
+
+        # Define extensions and build/run commands by language
+        lang_config = {
+            'python': {'ext': '.py', 'build': None, 'run': ['python', '{file}']},
+            'cpp': {'ext': '.cpp', 'build': ['g++', '-std=c++17', '{file}', '-o', '{file}.exe'], 'run': ['./{file}.exe']},
+            'js': {'ext': '.js', 'build': None, 'run': ['node', '{file}']},
+            'java': {'ext': '.java', 'build': ['javac', '{file}'], 'run': ['java', '{file}']},
+            'go': {'ext': '.go', 'build': ['go', 'build', '-o', '{file}.exe', '{file}'], 'run': ['./{file}.exe']},
+            'rust': {'ext': '.rs', 'build': ['rustc', '--test', '{file}', '-o', '{file}.exe'], 'run': ['./{file}.exe']}
+        }
         
-        temp_file = "grpo_eval_scratch.rs"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            f.write(extracted_code)
+        cfg = lang_config.get(lang, lang_config['python'])
+
+        with tempfile.NamedTemporaryFile(suffix=cfg['ext'], delete=False) as temp_file:
+            full_code = f"{extracted_code}\n\n{test_harness_string}"
+            temp_file.write(full_code.encode('utf-8'))
+            temp_path = temp_file.name
             
+        r_compile = 0.0
         try:
-            # Trigger verifiable compiler verification check
-            result = subprocess.run(
-                ["rustc", temp_file, "--crate-type=lib", "--color", "never"],
-                capture_output=True, 
-                text=True, 
-                timeout=5
-            )
-            r_compile = 1.0 if result.returncode == 0 else 0.0
+            if cfg['build']:
+                build_cmd = [part.format(file=temp_path) for part in cfg['build']]
+                build = subprocess.run(build_cmd, timeout=15, capture_output=True)
+                if build.returncode != 0:
+                    r_compile = 0.0
+                else:
+                    run_cmd = [part.format(file=temp_path) for part in cfg['run']]
+                    tests = subprocess.run(run_cmd, timeout=10, capture_output=True)
+                    r_compile = 1.0 if tests.returncode == 0 else 0.3
+            else:
+                run_cmd = [part.format(file=temp_path) for part in cfg['run']]
+                tests = subprocess.run(run_cmd, timeout=10, capture_output=True)
+                r_compile = 1.0 if tests.returncode == 0 else 0.0
         except Exception:
             r_compile = 0.0
         finally:
-            if os.path.exists(temp_file): 
-                os.remove(temp_file)
-            if os.path.exists("libgrpo_eval_scratch.rlib"): 
-                os.remove("libgrpo_eval_scratch.rlib")
+            if os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except: pass
+            if os.path.exists(f"{temp_path}.exe"):
+                try: os.remove(f"{temp_path}.exe")
+                except: pass
+            if lang == 'java' and os.path.exists(temp_path.replace('.java', '.class')):
+                try: os.remove(temp_path.replace('.java', '.class'))
+                except: pass
 
-        # Apply the regularized sparsity penalty calculation
         avg_loops = global_steps.float().mean().item()
         reward = r_compile - (self.gamma * avg_loops)
         return reward
 
-    def train_grpo_step(self, prompt_tokens, optimizer, group_size=4):
+    def train_grpo_step(self, prompt_tokens, test_harness_string, lang, optimizer, group_size=4):
         """
         Executes a Group Relative Policy Optimization weight update step.
         """
@@ -68,37 +93,38 @@ class GRPOLearningEngine:
         group_rollout_steps = [] # --- NEW: Track the detached routing choices
         
         # 1. Collect Group Generations asynchronously or sequentially
-        for _ in range(group_size):
-            with torch.no_grad():
-                student_concept, global_steps, _ = self.model(prompt_tokens)
-                
-                gen_ids = torch.full((1, 1), self.tokenizer.pad_token_id, dtype=torch.long, device=device)
-                log_probs_sampled = []
-                
-                for step in range(max_gen_len):
-                    logits = self.decoder(gen_ids, student_concept)
-                    next_token_logits = logits[:, -1, :]
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    
-                    next_token_id = torch.multinomial(probs, num_samples=1)
-                    log_prob = F.log_softmax(next_token_logits, dim=-1).gather(-1, next_token_id)
-                    log_probs_sampled.append(log_prob.squeeze(-1))
-                    
-                    gen_ids = torch.cat([gen_ids, next_token_id], dim=1)
-                    if next_token_id.item() == self.tokenizer.eos_token_id:
-                        break
-                        
-                text_out = self.tokenizer.decode(gen_ids[0, 1:], skip_special_tokens=True)
-                reward = self.compute_verifiable_reward(text_out, global_steps)
-                
-                group_tokens.append(gen_ids[:, 1:])
-                group_log_probs.append(torch.cat(log_probs_sampled))
-                group_rewards.append(reward)
-                
-                # --- NEW: Save the detached rollout steps for the Router's PPO ratio
-                group_rollout_steps.append(global_steps)
+        self.model.train()
+        self.decoder.train()
 
-        # 2. Compute Group Mean and Standard Deviation to derive Advantage Vectors
+        for _ in range(group_size):
+            # Remove no_grad so we sample with gradients enabled directly
+            student_concept, global_steps, _ = self.model(prompt_tokens)
+
+            gen_ids = torch.full((1, 1), self.tokenizer.pad_token_id, dtype=torch.long, device=device)
+            log_probs_sampled = []
+
+            for step in range(max_gen_len):
+                logits = self.decoder(gen_ids, student_concept)
+                next_token_logits = logits[:, -1, :]
+                probs = F.softmax(next_token_logits, dim=-1)
+                
+                next_token_id = torch.multinomial(probs, num_samples=1)
+                log_prob = F.log_softmax(next_token_logits, dim=-1).gather(-1, next_token_id)
+                log_probs_sampled.append(log_prob.squeeze(-1))
+                
+                gen_ids = torch.cat([gen_ids, next_token_id], dim=1)
+                if next_token_id.item() == self.tokenizer.eos_token_id:
+                    break
+                    
+            text_out = self.tokenizer.decode(gen_ids[0, 1:], skip_special_tokens=True)
+            # Call compute_verifiable_reward with text_output and test_harness_string
+            reward = self.compute_verifiable_reward(text_out, test_harness_string, lang, global_steps)
+
+            group_tokens.append(gen_ids[:, 1:])
+            group_log_probs.append(torch.cat(log_probs_sampled))
+            group_rewards.append(reward)
+            group_rollout_steps.append(global_steps)
+
         rewards_tensor = torch.tensor(group_rewards, dtype=torch.float32, device=device)
         mu = rewards_tensor.mean()
         sigma = rewards_tensor.std() if group_size > 1 else torch.tensor(1.0, device=device)
@@ -106,41 +132,16 @@ class GRPOLearningEngine:
             sigma = torch.tensor(1e-6, device=device)
         advantages = (rewards_tensor - mu) / sigma
 
-        # 3. Policy Optimization Backpropagation Step
-        self.model.train()
-        self.decoder.train()
-        
         total_loss = 0.0
         for idx in range(group_size):
-            # Re-evaluate log probabilities with active gradients
-            student_concept, current_global_steps, _ = self.model(prompt_tokens)
+            # We already have log_probs computed with gradients enabled, just apply REINFORCE
+            log_probs_sum = group_log_probs[idx].sum()
+            loss = -(log_probs_sum * advantages[idx])
             
-            # --- NEW: DAPPO Router Policy Optimization (arXiv:2606.30616) ---
-            # Treat the continuous routing steps as a secondary RL action space
-            route_ratio = current_global_steps / (group_rollout_steps[idx] + 1e-8)
+            # Router policy
+            route_ratio = group_rollout_steps[idx] / (group_rollout_steps[idx].detach() + 1e-8)
+            l_route_policy = -(route_ratio * advantages[idx]).mean()
             
-            # Apply PPO clipping specifically to the MambaGraphRouter's computation budget
-            route_surr1 = route_ratio * advantages[idx]
-            route_surr2 = torch.clamp(route_ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages[idx]
-            l_route_policy = -torch.min(route_surr1, route_surr2).mean()
-
-            # --- EXISTING: Foresight-Conditioned Calibration ---
-            predicted_success = self.model.foresight_head(student_concept).squeeze(-1)
-            actual_success = torch.tensor([group_rewards[idx]], dtype=torch.float32, device=device)
-            l_foresight = F.mse_loss(predicted_success, actual_success).mean()
-            
-            logits = self.decoder(group_tokens[idx], student_concept)
-            
-            log_probs_current = F.log_softmax(logits, dim=-1)
-            target_log_probs = log_probs_current.gather(-1, group_tokens[idx].unsqueeze(-1)).squeeze(-1)
-            
-            # --- EXISTING: Text Generation Policy Optimization ---
-            ratio = torch.exp(target_log_probs - group_log_probs[idx])
-            surr1 = ratio * advantages[idx]
-            surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages[idx]
-            loss = -torch.min(surr1, surr2).mean()
-            
-            # --- NEW: Combine Text Policy, Router Policy, and Foresight Grounding ---
-            total_loss += loss + l_route_policy + (0.5 * l_foresight)
+            total_loss += loss + l_route_policy
 
         return total_loss

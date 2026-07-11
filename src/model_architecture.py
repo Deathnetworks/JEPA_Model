@@ -83,34 +83,38 @@ class Mamba2SSDBlock(nn.Module):
             t_end = min(t_start + chunk_size, seq_len)
             c_len = t_end - t_start
 
-            # (Batch, chunk_size, nheads, 1, 1)
-            dt_chunk = dt[:, t_start:t_end, :].unsqueeze(-1).unsqueeze(-1)
-            # (Batch, chunk_size, nheads, 1, d_state)
-            B_chunk = B[:, t_start:t_end, :, :].unsqueeze(-1)
-            # (Batch, chunk_size, nheads, 1, d_head)
-            act_chunk = activated[:, t_start:t_end, :, :].unsqueeze(-2)
-            # (Batch, chunk_size, nheads, d_state, 1)
-            C_chunk = C[:, t_start:t_end, :, :].unsqueeze(-2)
+            dt_chunk = dt[:, t_start:t_end, :] # (B, L, H)
+            B_chunk = B[:, t_start:t_end, :, :].unsqueeze(-1) # (B, L, H, N, 1)
+            act_chunk = activated[:, t_start:t_end, :, :].unsqueeze(-2) # (B, L, H, 1, D)
+            C_chunk = C[:, t_start:t_end, :, :].unsqueeze(-2) # (B, L, H, 1, N)
 
-            # Since PyTorch lacks native associative scan, we use a hybrid approach
-            # for memory efficiency: small sequential loop inside the chunk, but keeping
-            # allocations tight.
-            chunk_outputs = []
-            for t_c in range(c_len):
-                dt_t = dt_chunk[:, t_c]
-                decay = torch.exp(-dt_t)
-                B_t = B_chunk[:, t_c]
-                act_t = act_chunk[:, t_c]
+            # V = dt * (B @ act) -> (B, L, H, N, D)
+            V = dt_chunk.unsqueeze(-1).unsqueeze(-1) * (B_chunk @ act_chunk)
 
-                mamba_state = decay * mamba_state + dt_t * (B_t @ act_t)
+            neg_dt = -dt_chunk
+            cumsum_dt = torch.cumsum(neg_dt, dim=1)
 
-                C_t = C_chunk[:, t_c]
-                out_t = (C_t @ mamba_state).squeeze(-2)
-                chunk_outputs.append(out_t)
+            C_t = cumsum_dt.unsqueeze(2) # (B, L, 1, H)
+            C_i = cumsum_dt.unsqueeze(1) # (B, 1, L, H)
+            decay_matrix = C_t - C_i
 
-            outputs.extend(chunk_outputs)
+            mask = torch.tril(torch.ones(c_len, c_len, device=x.device)).view(1, c_len, c_len, 1)
+            decay_matrix = decay_matrix.masked_fill(mask == 0, float('-inf'))
+            decay_weights = torch.exp(decay_matrix)
 
-        out_tensor = torch.stack(outputs, dim=1)
+            H_intra = torch.einsum('btih,bihnd->bthnd', decay_weights, V)
+
+            decay_state = torch.exp(cumsum_dt).view(batch, c_len, self.nheads, 1, 1)
+            H_inter = decay_state * mamba_state.unsqueeze(1)
+
+            H = H_intra + H_inter
+
+            out = (C_chunk @ H).squeeze(-2)
+            outputs.append(out)
+
+            mamba_state = H[:, -1]
+
+        out_tensor = torch.cat(outputs, dim=1)
         out_tensor = out_tensor.view(batch, seq_len, self.d_inner)
 
         out_tensor = out_tensor * F.silu(z)
@@ -252,7 +256,7 @@ class HierarchicalLatentProjectionHead(nn.Module):
 
 class MambaJEPAEngine(nn.Module):
     # Notice d_latent defaults to 1024 (Micro) + 4096 (Macro) = 5120
-    def __init__(self, vocab_size=32000, d_model=6144, num_blocks=32, max_budget=64, d_latent=5120):
+    def __init__(self, vocab_size=151680, d_model=6144, num_blocks=32, max_budget=64, d_latent=5120):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.mamba_loop = Mamba2LatentLoop8B(d_model=d_model, num_blocks=num_blocks, max_budget=max_budget)
@@ -296,7 +300,7 @@ class ClosedLoopLatentDecoder(nn.Module):
     Treats the latent concept vector as an examineable canvas conditioned via cross-attention.
     """
     # CRITICAL: Default d_latent updated to 5120 to ingest the hierarchical space
-    def __init__(self, d_latent=5120, max_seq_len=256, d_model=6144, vocab_size=32000):
+    def __init__(self, d_latent=5120, max_seq_len=256, d_model=6144, vocab_size=151680):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.d_model = d_model
@@ -343,7 +347,7 @@ class ClosedLoopLatentDecoder(nn.Module):
         return self.output_proj(decoded_seq)
 
 class DualStageLatentDecoder(nn.Module):
-    def __init__(self, d_latent=1024, max_seq_len=256, d_model=6144, vocab_size=32000):
+    def __init__(self, d_latent=1024, max_seq_len=256, d_model=6144, vocab_size=151680):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.d_model = d_model

@@ -143,29 +143,31 @@ def train_loop(
         gradient_accumulation_steps=16, 
         deepspeed_plugin=deepspeed_plugin
     )
-    device = accelerator.device
+    from src.runtime import get_device, empty_cache, get_autocast_kwargs, autocast_ctx
+    from src.checkpoint import save_ckpt, load_ckpt
+    device = get_device()
 
     if device.type == 'cpu':
         logging.warning("Running on CPU, using heavily downgraded hyperparameters to avoid OOM.")
-        model = MambaJEPAEngine(d_model=64, num_blocks=2, max_budget=2, d_latent=1024)
-        decoder = ClosedLoopLatentDecoder(d_latent=1024, d_model=64)
+        model = MambaJEPAEngine(vocab_size=vocab_size, d_model=64, num_blocks=2, max_budget=2, d_latent=1024)
+        decoder = ClosedLoopLatentDecoder(vocab_size=vocab_size, d_latent=1024, d_model=64)
     else:
-        model = MambaJEPAEngine()
-        decoder = ClosedLoopLatentDecoder()
+        model = MambaJEPAEngine(vocab_size=vocab_size)
+        decoder = ClosedLoopLatentDecoder(vocab_size=vocab_size)
 
 
 
 
     if os.path.exists("jepa_engine.pth"):
         try:
-            model.load_state_dict(torch.load("jepa_engine.pth", map_location=device, weights_only=True), strict=True)
+            load_ckpt(model, "jepa_engine.pth", device)
             logging.info("Successfully loaded pre-existing weights for jepa_engine.pth.")
         except Exception as e:
             logging.warning(f"Failed to load jepa_engine.pth: {e}")
 
     if os.path.exists("latent_decoder.pth"):
         try:
-            decoder.load_state_dict(torch.load("latent_decoder.pth", map_location=device, weights_only=True), strict=True)
+            load_ckpt(decoder, "latent_decoder.pth", device)
             logging.info("Successfully loaded pre-existing weights for latent_decoder.pth.")
         except Exception as e:
             logging.warning(f"Failed to load latent_decoder.pth: {e}")
@@ -183,15 +185,35 @@ def train_loop(
     decoder.train()
 
 
-    optimizer_grouped_parameters = [
-        {"params": [p for n, p in model.named_parameters() if p.requires_grad]},
-        {"params": [p for n, p in decoder.named_parameters() if p.requires_grad]}
+    import bitsandbytes as bnb
+    from galore_torch import GaLoreAdamW8bit
+
+    galore_params = []
+    non_galore_params = []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if isinstance(model.get_submodule(n.rsplit('.', 1)[0] if '.' in n else ''), nn.Linear):
+            galore_params.append(p)
+        else:
+            non_galore_params.append(p)
+
+    for n, p in decoder.named_parameters():
+        if not p.requires_grad:
+            continue
+        if isinstance(decoder.get_submodule(n.rsplit('.', 1)[0] if '.' in n else ''), nn.Linear):
+            galore_params.append(p)
+        else:
+            non_galore_params.append(p)
+
+    param_groups = [
+        {'params': non_galore_params},
+        {'params': galore_params, 'rank': 128, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
     ]
 
-    # --- UPGRADE: Replace 8-bit Adam with standard AdamW ---
-    # Because ZeRO-2 offloads this to System RAM, we no longer need VRAM quantization here.
-    optimizer = optim.AdamW(
-        optimizer_grouped_parameters,
+    optimizer = bnb.optim.PagedAdamW8bit(
+        param_groups,
+
         lr=learning_rate,
         betas=(0.9, 0.95),
         weight_decay=0.1
@@ -232,9 +254,8 @@ def train_loop(
 
     chunk_size = 4096
     accumulation_steps = 16
-    optimizer.zero_grad()
-
     global_mb_step = 0
+    optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
 
     for epoch in range(starting_epoch, epochs):
@@ -244,6 +265,8 @@ def train_loop(
             active_dataloader = dataloader
 
         for chunk_idx, flattened_chunk in enumerate(active_dataloader):
+            if global_mb_step % accumulation_steps == 0:
+                optimizer.zero_grad(set_to_none=True)
             if not flattened_chunk:
                 continue
 
@@ -325,7 +348,6 @@ def train_loop(
                     torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
                     optimizer.step()
                     lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
                     empty_cache()
 
                 if global_mb_step % 10 == 0:
@@ -357,9 +379,9 @@ def train_loop(
 
     if True:
         raw_model = getattr(model, "_orig_mod", model)
-        torch.save(raw_model.state_dict(), "jepa_engine.pth")
+        save_ckpt(raw_model, "jepa_engine.pth")
         raw_decoder = getattr(decoder, "_orig_mod", decoder)
-        torch.save(raw_decoder.state_dict(), "latent_decoder.pth")
+        save_ckpt(raw_decoder, "latent_decoder.pth")
         logging.info("Models saved.")
 
 if __name__ == "__main__":
