@@ -1,3 +1,4 @@
+from src.runtime import get_device, empty_cache, autocast_ctx, get_vocab_size
 import os
 import csv
 import time
@@ -131,26 +132,18 @@ def train_loop(
     curriculum_phase="frontier_traces"
 ):
     # --- NEW: DeepSpeed ZeRO-2 CPU Offload ---
-    deepspeed_plugin = DeepSpeedPlugin(
-        zero_stage=2,
-        offload_optimizer_device="cpu",
-        offload_param_device="none", # Keep weights on XPU for maximum compute speed
-        gradient_accumulation_steps=16,
-        gradient_clipping=1.0
-    )
     
-    accelerator = Accelerator(
-        gradient_accumulation_steps=16, 
-        deepspeed_plugin=deepspeed_plugin
-    )
-    from src.runtime import get_device, empty_cache, get_autocast_kwargs, autocast_ctx
+
+
+
     from src.checkpoint import save_ckpt, load_ckpt
     device = get_device()
+    vocab_size = get_vocab_size()
 
     if device.type == 'cpu':
         logging.warning("Running on CPU, using heavily downgraded hyperparameters to avoid OOM.")
-        model = MambaJEPAEngine(vocab_size=vocab_size, d_model=64, num_blocks=2, max_budget=2, d_latent=1024)
-        decoder = ClosedLoopLatentDecoder(vocab_size=vocab_size, d_latent=1024, d_model=64)
+        model = MambaJEPAEngine(vocab_size=vocab_size, d_model=64, num_blocks=2, max_budget=2, d_latent=5120)
+        decoder = ClosedLoopLatentDecoder(vocab_size=vocab_size, d_latent=5120, d_model=64)
     else:
         model = MambaJEPAEngine(vocab_size=vocab_size)
         decoder = ClosedLoopLatentDecoder(vocab_size=vocab_size)
@@ -189,35 +182,34 @@ def train_loop(
     from galore_torch import GaLoreAdamW8bit
 
     galore_params = []
-    non_galore_params = []
-    for n, p in model.named_parameters():
+    plain_params = []
+    exclude_tokens = ['bias', 'norm', 'A_log_spectral', 'discrete_embeddings', 'expansion_gate', 'foresight_head', 'embedding']
+    for n, p in list(model.named_parameters()) + list(decoder.named_parameters()):
         if not p.requires_grad:
             continue
-        if isinstance(model.get_submodule(n.rsplit('.', 1)[0] if '.' in n else ''), nn.Linear):
+        if p.ndim >= 2 and not any(t in n for t in exclude_tokens) and p.shape[0] >= 256 and p.shape[1] >= 256:
             galore_params.append(p)
         else:
-            non_galore_params.append(p)
-
-    for n, p in decoder.named_parameters():
-        if not p.requires_grad:
-            continue
-        if isinstance(decoder.get_submodule(n.rsplit('.', 1)[0] if '.' in n else ''), nn.Linear):
-            galore_params.append(p)
-        else:
-            non_galore_params.append(p)
+            plain_params.append(p)
 
     param_groups = [
-        {'params': non_galore_params},
+        {'params': plain_params},
         {'params': galore_params, 'rank': 128, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
     ]
-
-    optimizer = bnb.optim.PagedAdamW8bit(
-        param_groups,
-
-        lr=learning_rate,
-        betas=(0.9, 0.95),
-        weight_decay=0.1
-    )
+    if device.type == 'cpu':
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            lr=learning_rate,
+            betas=(0.9, 0.95),
+            weight_decay=0.1
+        )
+    else:
+        optimizer = bnb.optim.PagedAdamW8bit(
+            param_groups,
+            lr=learning_rate,
+            betas=(0.9, 0.95),
+            weight_decay=0.1
+        )
 
     criterion = TripartiteLoss(max_loops=4)
 
@@ -254,7 +246,7 @@ def train_loop(
 
     chunk_size = 4096
     accumulation_steps = 16
-    global_mb_step = 0
+    global_mb_step = 1
     optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
 
@@ -265,8 +257,6 @@ def train_loop(
             active_dataloader = dataloader
 
         for chunk_idx, flattened_chunk in enumerate(active_dataloader):
-            if global_mb_step % accumulation_steps == 0:
-                optimizer.zero_grad(set_to_none=True)
             if not flattened_chunk:
                 continue
 
@@ -295,7 +285,7 @@ def train_loop(
                     c_input = padded_input[:, t:t+chunk_size]
                     c_qwen = padded_qwen[:, t:t+chunk_size] if padded_qwen.size(1) > 1 else padded_qwen
 
-                    with torch.autocast(**get_autocast_kwargs()):
+                    with autocast_ctx(device):
                         student_concept, global_steps, mamba_state = model(c_input, mamba_state=mamba_state)
                         
                         # Apply teacher forcing shift logic to train the cross-attended decoder
@@ -368,11 +358,11 @@ def train_loop(
             torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
             optimizer.step()
             lr_scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
             empty_cache()
 
 
         if True:
+            os.makedirs(checkpoint_dir, exist_ok=True)
             with open(metadata_path, 'w') as f:
                 f.write(f"{epoch+1},0")
             logging.info(f"Checkpoint saved to {checkpoint_dir}")

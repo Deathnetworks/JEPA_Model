@@ -1,28 +1,25 @@
 import torch
 import gc
 from contextlib import nullcontext
+from transformers import AutoTokenizer
 
 def get_device():
-    # Since we are forced to target Intel Arc Pro B70 natively on Windows using XPU
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.device("xpu")
-    else:
-        return torch.device("cpu")
+    return torch.device("cpu")
 
 def empty_cache():
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         torch.xpu.empty_cache()
     gc.collect()
 
-def get_autocast_kwargs():
-    device = get_device()
-    if device.type == "xpu":
-        return {"device_type": "xpu", "dtype": torch.bfloat16}
-    else:
-        return {"device_type": "cpu", "enabled": False}
+def autocast_ctx(device=None):
+    device = device or get_device()
+    if device.type in ("xpu", "cuda"):
+        return torch.autocast(device.type, dtype=torch.bfloat16)
+    return nullcontext()
 
-def autocast_ctx(device):
-    if device.type == "xpu":
-        return torch.autocast(device_type="xpu", dtype=torch.bfloat16)
-    else:
-        return nullcontext()
+def get_vocab_size(tokenizer_name="Qwen/Qwen2.5-7B-Instruct"):
+    tok = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    # Pad to nearest multiple of 64 for native Intel XMX GEMM alignment
+    return ((max(len(tok), tok.vocab_size) + 63) // 64) * 64
