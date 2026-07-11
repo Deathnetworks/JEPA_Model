@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 from datasets import load_dataset
 from transformers import AutoTokenizer
-import bitsandbytes as bnb
 import torch.optim as optim
 
 try:
@@ -103,8 +102,9 @@ def train_rl_loop(
     model = model.to(device)
     decoder = decoder.to(device)
 
-    import bitsandbytes as bnb
-    from galore_torch import GaLoreAdamW8bit
+    if device.type != "cpu":
+        import bitsandbytes as bnb
+        from galore_torch import GaLoreAdamW8bit
 
     galore_params = []
     non_galore_params = []
@@ -129,7 +129,15 @@ def train_rl_loop(
         {'params': galore_params, 'rank': 128, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
     ]
 
-    optimizer = bnb.optim.PagedAdamW8bit(
+    if device.type == "cpu":
+        optimizer = optim.AdamW(
+            param_groups,
+            lr=learning_rate,
+            betas=(0.9, 0.95),
+            weight_decay=0.1
+        )
+    else:
+        optimizer = bnb.optim.PagedAdamW8bit(
         param_groups,
 
         lr=learning_rate,

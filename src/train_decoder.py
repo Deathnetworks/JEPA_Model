@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 from src.runtime import get_device, empty_cache, get_autocast_kwargs
 from torch.utils.data import Dataset, DataLoader
-import bitsandbytes as bnb
 
 try:
     import intel_extension_for_pytorch as ipex
@@ -42,10 +41,12 @@ class DecoderDataset(Dataset):
             logging.warning(f"Failed to load chunk {file_path}: {e}")
             return []
 
+import random
 def collate_decoder_chunk(batch):
     flattened = [item for sublist in batch for item in sublist]
     if not flattened:
         return None
+    random.shuffle(flattened)
     return flattened
 
 def get_decoder_dataloader(data_dir=r"F:\JEPA_Model\data\shards", batch_size=1, num_workers=2):
@@ -78,7 +79,15 @@ def train_decoder_loop(
 
     model.train()
 
-    optimizer = bnb.optim.AdamW8bit(
+    if device.type == "cpu":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            betas=(0.9, 0.95),
+            weight_decay=0.1
+        )
+    else:
+        optimizer = bnb.optim.AdamW8bit(
         model.parameters(),
         lr=learning_rate,
         betas=(0.9, 0.95),

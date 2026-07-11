@@ -1,3 +1,5 @@
+from transformers import AutoTokenizer
+
 from src.runtime import get_device, empty_cache, autocast_ctx, get_vocab_size
 import os
 import csv
@@ -12,7 +14,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import bitsandbytes as bnb
 
 try:
     import intel_extension_for_pytorch as ipex
@@ -26,9 +27,9 @@ from src.model_architecture import Mamba2LatentLoop8B, MambaJEPAEngine, ClosedLo
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class TripartiteLoss(nn.Module):
-    def __init__(self, max_loops=4, lambda_spectral=0.1):
+    def __init__(self, pad_id, max_loops=4, lambda_spectral=0.1):
         super().__init__()
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=0)
+        self.pad_id = pad_id
         self.max_loops = max_loops
         self.lambda_route = 0.01
         self.lambda_spectral = lambda_spectral # NEW: Coefficient for Spectral Uniformity
@@ -39,7 +40,8 @@ class TripartiteLoss(nn.Module):
         qwen_tokens_flat = qwen_tokens.reshape(-1)
 
         # 1. Cross-Entropy Loss (Text Generation)
-        l_ce = self.ce_loss(logits_flat, qwen_tokens_flat)
+        mask = qwen_tokens_flat.ne(self.pad_id)
+        l_ce = (F.cross_entropy(logits_flat, qwen_tokens_flat, reduction="none") * mask).sum() / mask.sum().clamp_min(1)
 
         # 2. JEPA Alignment Loss (Positive Pairs)
         # --- NEW: Hierarchical Sliced Alignment ---
@@ -104,10 +106,12 @@ class JEPADataset(Dataset):
             logging.warning(f"Failed to load chunk {file_path}: {e}")
             return []
 
+import random
 def collate_jepa_chunk(batch):
     flattened = [item for sublist in batch for item in sublist]
     if not flattened:
         return None
+    random.shuffle(flattened)
     return flattened
 
 def get_dataloader(data_dir=r"F:\JEPA_Model\data\shards", batch_size=1, num_workers=2, curriculum_phase="frontier_traces"):
@@ -116,7 +120,7 @@ def get_dataloader(data_dir=r"F:\JEPA_Model\data\shards", batch_size=1, num_work
     return DataLoader(
         dataset, 
         batch_size=batch_size, 
-        shuffle=False, 
+        shuffle=True,
         num_workers=num_workers, 
         collate_fn=collate_jepa_chunk,
         pin_memory=True,       # Stages tensors in page-locked RAM for instant PCIe transfer
@@ -155,15 +159,15 @@ def train_loop(
         try:
             load_ckpt(model, "jepa_engine.pth", device)
             logging.info("Successfully loaded pre-existing weights for jepa_engine.pth.")
-        except Exception as e:
-            logging.warning(f"Failed to load jepa_engine.pth: {e}")
+        except FileNotFoundError:
+            logging.warning("Failed to load jepa_engine.pth")
 
     if os.path.exists("latent_decoder.pth"):
         try:
             load_ckpt(decoder, "latent_decoder.pth", device)
             logging.info("Successfully loaded pre-existing weights for latent_decoder.pth.")
-        except Exception as e:
-            logging.warning(f"Failed to load latent_decoder.pth: {e}")
+        except FileNotFoundError:
+            logging.warning("Failed to load latent_decoder.pth")
     if device.type == "xpu":
         torch._inductor.config.freezing = True
         torch._inductor.config.max_autotune = True
@@ -204,6 +208,14 @@ def train_loop(
             weight_decay=0.1
         )
     else:
+        if device.type == "cpu":
+        optimizer = optim.AdamW(
+            param_groups,
+            lr=learning_rate,
+            betas=(0.9, 0.95),
+            weight_decay=0.1
+        )
+    else:
         optimizer = bnb.optim.PagedAdamW8bit(
             param_groups,
             lr=learning_rate,
@@ -211,7 +223,19 @@ def train_loop(
             weight_decay=0.1
         )
 
-    criterion = TripartiteLoss(max_loops=4)
+
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct", trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is not None:
+            pad_id = tokenizer.eos_token_id
+        else:
+            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+            pad_id = tokenizer.pad_token_id
+    else:
+        pad_id = tokenizer.pad_token_id
+
+    criterion = TripartiteLoss(pad_id=pad_id, max_loops=4)
+
 
     dataloader = get_dataloader(data_dir=data_dir, batch_size=1, curriculum_phase=curriculum_phase)
 
@@ -246,7 +270,7 @@ def train_loop(
 
     chunk_size = 4096
     accumulation_steps = 16
-    global_mb_step = 1
+    global_mb_step = 0
     optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
 
@@ -270,8 +294,8 @@ def train_loop(
                 qwen_tokens_list = [item.get("qwen_tokens", item["input_tokens"]) for item in mini_batch]
                 target_concepts_list = [item["target_concept"] for item in mini_batch]
 
-                padded_input = torch.nn.utils.rnn.pad_sequence(input_tokens_list, batch_first=True, padding_value=0).to(device)
-                padded_qwen = torch.nn.utils.rnn.pad_sequence(qwen_tokens_list, batch_first=True, padding_value=0).to(device)
+                padded_input = torch.nn.utils.rnn.pad_sequence(input_tokens_list, batch_first=True, padding_value=pad_id).to(device)
+                padded_qwen = torch.nn.utils.rnn.pad_sequence(qwen_tokens_list, batch_first=True, padding_value=pad_id).to(device)
                 target_concepts = torch.stack(target_concepts_list).to(device)
 
                 seq_len = padded_input.size(1)
@@ -283,10 +307,11 @@ def train_loop(
 
                 for t in range(0, seq_len, chunk_size):
                     c_input = padded_input[:, t:t+chunk_size]
+                    attention_mask = c_input.ne(pad_id).float()
                     c_qwen = padded_qwen[:, t:t+chunk_size] if padded_qwen.size(1) > 1 else padded_qwen
 
                     with autocast_ctx(device):
-                        student_concept, global_steps, mamba_state = model(c_input, mamba_state=mamba_state)
+                        student_concept, global_steps, mamba_state = model(c_input, mamba_state=mamba_state, attention_mask=attention_mask)
                         
                         # Apply teacher forcing shift logic to train the cross-attended decoder
                         if c_qwen.size(1) > 1:
@@ -337,6 +362,7 @@ def train_loop(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
                     optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
                     lr_scheduler.step()
                     empty_cache()
 
@@ -357,6 +383,7 @@ def train_loop(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
             lr_scheduler.step()
             empty_cache()
 

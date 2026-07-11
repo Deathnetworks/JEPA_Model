@@ -74,37 +74,37 @@ class GRPOLearningEngine:
         group_rollout_steps = [] # --- NEW: Track the detached routing choices
         
         # 1. Collect Group Generations asynchronously or sequentially
-        self.model.train()
-        self.decoder.train()
+        self.model.eval()
+        self.decoder.eval()
 
         for _ in range(group_size):
             with torch.no_grad():
                 student_concept, global_steps, _ = self.model(prompt_tokens)
 
-            gen_ids = torch.full((1, 1), self.tokenizer.pad_token_id, dtype=torch.long, device=device)
-            log_probs_sampled = []
+                gen_ids = torch.full((1, 1), self.tokenizer.pad_token_id, dtype=torch.long, device=device)
+                
+                for step in range(max_gen_len):
+                    logits = self.decoder(gen_ids, student_concept)
+                    next_token_logits = logits[:, -1, :]
+                    probs = F.softmax(next_token_logits, dim=-1)
 
-            for step in range(max_gen_len):
-                logits = self.decoder(gen_ids, student_concept)
-                next_token_logits = logits[:, -1, :]
-                probs = F.softmax(next_token_logits, dim=-1)
-                
-                next_token_id = torch.multinomial(probs, num_samples=1)
-                log_prob = F.log_softmax(next_token_logits, dim=-1).gather(-1, next_token_id)
-                log_probs_sampled.append(log_prob.squeeze(-1))
-                
-                gen_ids = torch.cat([gen_ids, next_token_id], dim=1)
-                if next_token_id.item() == self.tokenizer.eos_token_id:
-                    break
+                    next_token_id = torch.multinomial(probs, num_samples=1)
                     
-            text_out = self.tokenizer.decode(gen_ids[0, 1:], skip_special_tokens=True)
-            # Call compute_verifiable_reward with text_output and test_harness_string
-            reward = self.compute_verifiable_reward(text_out, test_harness_string, lang, global_steps)
+                    gen_ids = torch.cat([gen_ids, next_token_id], dim=1)
+                    if next_token_id.item() == self.tokenizer.eos_token_id:
+                        break
 
-            group_tokens.append(gen_ids[:, 1:])
-            group_log_probs.append(torch.cat(log_probs_sampled))
-            group_rewards.append(reward)
-            group_rollout_steps.append(global_steps)
+                text_out = self.tokenizer.decode(gen_ids[0, 1:], skip_special_tokens=True)
+                # Call compute_verifiable_reward with text_output and test_harness_string
+                reward = self.compute_verifiable_reward(text_out, test_harness_string, lang, global_steps)
+
+                group_tokens.append(gen_ids)
+                group_rewards.append(reward)
+                group_rollout_steps.append(global_steps)
+
+        # 2. Re-score with gradients enabled
+        self.model.train()
+        self.decoder.train()
 
         rewards_tensor = torch.tensor(group_rewards, dtype=torch.float32, device=device)
         mu = rewards_tensor.mean()
@@ -115,11 +115,20 @@ class GRPOLearningEngine:
 
         total_loss = 0.0
         for idx in range(group_size):
-            # We already have log_probs computed with gradients enabled, just apply REINFORCE
-            log_probs_sum = group_log_probs[idx].sum()
+            gen_ids = group_tokens[idx]
+            student_concept, global_steps, _ = self.model(prompt_tokens)
+
+            # Teacher forcing
+            logits = self.decoder(gen_ids[:, :-1], student_concept)
+
+            # Compute log probs
+            log_probs = F.log_softmax(logits, dim=-1)
+            target_ids = gen_ids[:, 1:].unsqueeze(-1)
+            gathered_log_probs = log_probs.gather(-1, target_ids).squeeze(-1)
+
+            log_probs_sum = gathered_log_probs.sum()
             loss = -(log_probs_sum * advantages[idx])
             
             total_loss += loss
-
 
         return total_loss

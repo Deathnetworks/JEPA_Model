@@ -3,7 +3,7 @@ import os
 import torch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.model_architecture import MambaJEPAEngine, DualStageLatentDecoder
+from src.model_architecture import MambaJEPAEngine, ClosedLoopLatentDecoder
 
 def test_engine_tensor_shapes():
     """
@@ -17,13 +17,13 @@ def test_engine_tensor_shapes():
     d_model = 64
     num_blocks = 2
     model = MambaJEPAEngine(vocab_size=32000, d_model=d_model, num_blocks=num_blocks, max_budget=4, d_latent=5120).to(device)
-    decoder = DualStageLatentDecoder(d_latent=5120, max_seq_len=512, d_model=d_model, vocab_size=32000).to(device)
+    decoder = ClosedLoopLatentDecoder(d_latent=5120, max_seq_len=512, d_model=d_model, vocab_size=32000).to(device)
 
     model.eval()
     decoder.eval()
 
     batch_size = 2
-    seq_len = 512
+    seq_len = 32
     mock_tokens = torch.randint(0, 32000, (batch_size, seq_len)).to(device)
 
     # Initial state for Chunk 1
@@ -32,7 +32,8 @@ def test_engine_tensor_shapes():
     with torch.no_grad():
         # Execute the ALGR routed forward pass
         jepa_concept, global_steps, final_state = model(mock_tokens, mamba_state=mamba_state)
-        logits = decoder(jepa_concept)
+        gen_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
+        logits = decoder(gen_ids, jepa_concept)
 
     print("\n--- Tensor Dimensionality Report ---")
     
