@@ -75,11 +75,14 @@ class GRPOLearningEngine:
         
         # 1. Collect Group Generations asynchronously or sequentially
         self.model.eval()
-        self.decoder.eval()
+        self.decoder.train()
+
+        with torch.no_grad():
+            student_concept, global_steps, _ = self.model(prompt_tokens)
 
         for _ in range(group_size):
             with torch.no_grad():
-                student_concept, global_steps, _ = self.model(prompt_tokens)
+
 
                 gen_ids = torch.full((1, 1), self.tokenizer.pad_token_id, dtype=torch.long, device=device)
                 
@@ -103,7 +106,7 @@ class GRPOLearningEngine:
                 group_rollout_steps.append(global_steps)
 
         # 2. Re-score with gradients enabled
-        self.model.train()
+        self.model.eval()
         self.decoder.train()
 
         rewards_tensor = torch.tensor(group_rewards, dtype=torch.float32, device=device)
@@ -116,7 +119,8 @@ class GRPOLearningEngine:
         total_loss = 0.0
         for idx in range(group_size):
             gen_ids = group_tokens[idx]
-            student_concept, global_steps, _ = self.model(prompt_tokens)
+            # Use the pre-computed concept
+
 
             # Teacher forcing
             logits = self.decoder(gen_ids[:, :-1], student_concept)

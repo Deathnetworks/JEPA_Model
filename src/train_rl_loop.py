@@ -4,6 +4,7 @@ import os
 import time
 
 import torch
+from src.optim import build_optimizer
 import torch.nn as nn
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -57,7 +58,7 @@ def train_rl_loop(
     decoder_path: str = "latent_decoder.pth",
     tokenizer_name: str = "Qwen/Qwen2.5-7B-Instruct",
 ):
-    from src.runtime import get_device, empty_cache, get_autocast_kwargs
+    from src.runtime import get_device, empty_cache, autocast_ctx
     device = get_device()
 
     logging.info(f"Loading tokenizer {tokenizer_name}...")
@@ -106,44 +107,7 @@ def train_rl_loop(
         import bitsandbytes as bnb
         from galore_torch import GaLoreAdamW8bit
 
-    galore_params = []
-    non_galore_params = []
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if isinstance(model.get_submodule(n.rsplit('.', 1)[0] if '.' in n else ''), nn.Linear):
-            galore_params.append(p)
-        else:
-            non_galore_params.append(p)
-
-    for n, p in decoder.named_parameters():
-        if not p.requires_grad:
-            continue
-        if isinstance(decoder.get_submodule(n.rsplit('.', 1)[0] if '.' in n else ''), nn.Linear):
-            galore_params.append(p)
-        else:
-            non_galore_params.append(p)
-
-    param_groups = [
-        {'params': non_galore_params},
-        {'params': galore_params, 'rank': 128, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
-    ]
-
-    if device.type == "cpu":
-        optimizer = optim.AdamW(
-            param_groups,
-            lr=learning_rate,
-            betas=(0.9, 0.95),
-            weight_decay=0.1
-        )
-    else:
-        optimizer = bnb.optim.PagedAdamW8bit(
-        param_groups,
-
-        lr=learning_rate,
-        betas=(0.9, 0.95),
-        weight_decay=0.1
-    )
+    optimizer = build_optimizer(model, decoder, learning_rate, device)
 
     grpo_engine = GRPOLearningEngine(model, decoder, tokenizer)
 
@@ -172,7 +136,7 @@ def train_rl_loop(
             try:
                 inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-                with torch.autocast(**get_autocast_kwargs()):
+                with autocast_ctx(device):
                     loss = grpo_engine.train_grpo_step(inputs["input_ids"], test_harness, lang, optimizer, group_size=group_size)
 
                 loss_scaled = loss / 16
@@ -193,6 +157,7 @@ def train_rl_loop(
                 if step_idx % 100 == 0:
 
                      if True:
+                         os.makedirs(checkpoint_dir, exist_ok=True)
                          with open(metadata_path, 'w') as f:
                              f.write(f"{epoch},{step_idx}")
                          logging.info(f"Checkpoint saved to {checkpoint_dir}")

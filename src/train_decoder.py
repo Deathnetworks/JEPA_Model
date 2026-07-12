@@ -5,8 +5,9 @@ import logging
 from pathlib import Path
 
 import torch
+from src.optim import build_optimizer
 import torch.nn as nn
-from src.runtime import get_device, empty_cache, get_autocast_kwargs
+from src.runtime import get_device, empty_cache, autocast_ctx
 from torch.utils.data import Dataset, DataLoader
 
 try:
@@ -79,20 +80,7 @@ def train_decoder_loop(
 
     model.train()
 
-    if device.type == "cpu":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-            betas=(0.9, 0.95),
-            weight_decay=0.1
-        )
-    else:
-        optimizer = bnb.optim.AdamW8bit(
-        model.parameters(),
-        lr=learning_rate,
-        betas=(0.9, 0.95),
-        weight_decay=0.1
-    )
+    optimizer = build_optimizer(model, None, learning_rate, device)
 
     criterion = nn.CrossEntropyLoss(ignore_index=0)
     dataloader = get_decoder_dataloader(data_dir=data_dir, batch_size=1)
@@ -138,7 +126,7 @@ def train_decoder_loop(
 
                 optimizer.zero_grad()
 
-                with torch.autocast(**get_autocast_kwargs()):
+                with autocast_ctx(device):
                     # Forward pass conditions token generation on both history and the concept vector
                     logits = model(decoder_input, target_concept)
 

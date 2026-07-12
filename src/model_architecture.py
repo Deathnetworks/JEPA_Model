@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
 
 class MambaGraphRouter(nn.Module):
     """
@@ -176,9 +177,18 @@ class Mamba2LatentLoop8B(nn.Module):
             A_discrete = torch.exp(-torch.exp(self.A_log_spectral) * 1.0)
             hidden_state = (hidden_state * A_discrete) + step_env + block_env
 
-            block_out, new_mamba_state[current_block_idx] = self.blocks[current_block_idx](
-                hidden_state, mamba_state_list[current_block_idx]
-            )
+
+            if self.training:
+                block_out, new_mamba_state[current_block_idx] = checkpoint.checkpoint(
+                    self.blocks[current_block_idx],
+                    hidden_state,
+                    mamba_state_list[current_block_idx],
+                    use_reentrant=False
+                )
+            else:
+                block_out, new_mamba_state[current_block_idx] = self.blocks[current_block_idx](
+                    hidden_state, mamba_state_list[current_block_idx]
+                )
             
             # --- NEW: DiscoLoop Discrete Realignment (arXiv:2607.00341) ---
             # 1. Project the continuous block output to the discrete concept space
