@@ -1,6 +1,6 @@
 from transformers import AutoTokenizer
 
-from src.runtime import get_device, empty_cache, autocast_ctx, get_vocab_size
+from src.runtime import get_device, empty_cache, autocast_ctx, get_tokenizer_and_vocab
 import os
 import csv
 import time
@@ -11,6 +11,7 @@ import torch.optim as optim
 from pathlib import Path
 
 import torch
+from src.optim import build_optimizer
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -142,7 +143,7 @@ def train_loop(
 
     from src.checkpoint import save_ckpt, load_ckpt
     device = get_device()
-    vocab_size = get_vocab_size()
+    vocab_size = get_tokenizer_and_vocab()
 
     if device.type == 'cpu':
         logging.warning("Running on CPU, using heavily downgraded hyperparameters to avoid OOM.")
@@ -185,28 +186,7 @@ def train_loop(
     import bitsandbytes as bnb
     from galore_torch import GaLoreAdamW8bit
 
-    galore_params = []
-    plain_params = []
-    exclude_tokens = ['bias', 'norm', 'A_log_spectral', 'discrete_embeddings', 'expansion_gate', 'foresight_head', 'embedding']
-    for n, p in list(model.named_parameters()) + list(decoder.named_parameters()):
-        if not p.requires_grad:
-            continue
-        if p.ndim >= 2 and not any(t in n for t in exclude_tokens) and p.shape[0] >= 256 and p.shape[1] >= 256:
-            galore_params.append(p)
-        else:
-            plain_params.append(p)
-
-    param_groups = [
-        {'params': plain_params},
-        {'params': galore_params, 'rank': 128, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
-    ]
-    if device.type == 'cpu':
-        optimizer = torch.optim.AdamW(
-            param_groups,
-            lr=learning_rate,
-            betas=(0.9, 0.95),
-            weight_decay=0.1
-        )
+    optimizer = build_optimizer(model, None, learning_rate, device)
     else:
         if device.type == "cpu":
         optimizer = optim.AdamW(

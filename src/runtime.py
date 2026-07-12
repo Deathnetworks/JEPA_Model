@@ -19,7 +19,9 @@ def autocast_ctx(device=None):
         return torch.autocast(device.type, dtype=torch.bfloat16)
     return nullcontext()
 
-def get_vocab_size(tokenizer_name="Qwen/Qwen2.5-7B-Instruct"):
+def get_tokenizer_and_vocab(tokenizer_name="Qwen/Qwen2.5-7B-Instruct"):
     tok = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
-    # Pad to nearest multiple of 64 for native Intel XMX GEMM alignment
-    return ((max(len(tok), tok.vocab_size) + 63) // 64) * 64
+    if tok.pad_token_id is None:
+        tok.add_special_tokens({'pad_token': '<|pad|>'})
+    vocab_size = ((max(len(tok), tok.vocab_size) + 63) // 64) * 64
+    return tok, vocab_size, tok.pad_token_id
