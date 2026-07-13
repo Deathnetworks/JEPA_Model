@@ -22,28 +22,37 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 
-def stream_rl_prompts(dataset_name="bigcode/humanevalpack", start_idx=0):
+def stream_rl_prompts(dataset_name="bigcode/humanevalpack", start_idx=0, target_lang="rust"):
     """
-    Streams multi-language RL prompts across all 6 languages.
+    Streams multi-language RL prompts across specific language or all 6 languages.
     """
     from datasets import interleave_datasets
 
-    languages = ['python', 'cpp', 'js', 'java', 'go', 'rust']
-    datasets = []
+    if target_lang == "all":
+        languages = ['python', 'cpp', 'js', 'java', 'go', 'rust']
+        datasets = []
 
-    for lang in languages:
+        for lang in languages:
+            try:
+                ds = load_dataset(dataset_name, lang, split="train", streaming=True)
+                # Tag each language so the engine knows how to compile/run the test harness
+                ds = ds.map(lambda x: {**x, '_lang': lang})
+                datasets.append(ds)
+            except Exception as e:
+                logging.warning(f"Could not load language {lang}: {e}")
+
+        if not datasets:
+            return
+
+        dataset = interleave_datasets(datasets)
+    else:
         try:
-            ds = load_dataset(dataset_name, lang, split="train", streaming=True)
-            # Tag each language so the engine knows how to compile/run the test harness
-            ds = ds.map(lambda x: {**x, '_lang': lang})
-            datasets.append(ds)
+            dataset = load_dataset(dataset_name, target_lang, split="train", streaming=True)
+            dataset = dataset.map(lambda x: {**x, '_lang': target_lang})
         except Exception as e:
-            logging.warning(f"Could not load language {lang}: {e}")
+            logging.error(f"Could not load language {target_lang}: {e}")
+            return
 
-    if not datasets:
-        return
-
-    dataset = interleave_datasets(datasets)
     dataset = dataset.skip(start_idx)
 
     for row in dataset:
@@ -57,6 +66,7 @@ def train_rl_loop(
     engine_path: str = "jepa_engine.pth",
     decoder_path: str = "latent_decoder.pth",
     tokenizer_name: str = "Qwen/Qwen2.5-7B-Instruct",
+    rl_language: str = "rust",
 ):
     from src.runtime import get_device, empty_cache, autocast_ctx
     device = get_device()
@@ -127,7 +137,7 @@ def train_rl_loop(
             logging.info(f"Resuming at Epoch {starting_epoch}, Step {starting_step}")
 
     for epoch in range(starting_epoch, epochs):
-        prompt_generator = stream_rl_prompts(dataset_name=dataset_name, start_idx=starting_step if epoch == starting_epoch else 0)
+        prompt_generator = stream_rl_prompts(dataset_name=dataset_name, start_idx=starting_step if epoch == starting_epoch else 0, target_lang=rl_language)
 
         step_idx = starting_step if epoch == starting_epoch else 0
 
@@ -176,5 +186,6 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--dataset", type=str, default="bigcode/humanevalpack")
     parser.add_argument("--group_size", type=int, default=4)
+    parser.add_argument("--rl_language", type=str, default="rust", help="Specific language split or 'all'")
     args = parser.parse_args()
-    train_rl_loop(epochs=args.epochs, dataset_name=args.dataset, group_size=args.group_size)
+    train_rl_loop(epochs=args.epochs, dataset_name=args.dataset, group_size=args.group_size, rl_language=args.rl_language)
