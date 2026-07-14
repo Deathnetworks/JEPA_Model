@@ -28,30 +28,25 @@ def stream_rl_prompts(dataset_name="bigcode/humanevalpack", start_idx=0, target_
     """
     from datasets import interleave_datasets
 
-    if target_lang == "all":
+    if target_lang.lower() == "all":
         languages = ['python', 'cpp', 'js', 'java', 'go', 'rust']
-        datasets = []
-
-        for lang in languages:
-            try:
-                ds = load_dataset(dataset_name, lang, split="train", streaming=True)
-                # Tag each language so the engine knows how to compile/run the test harness
-                ds = ds.map(lambda x: {**x, '_lang': lang})
-                datasets.append(ds)
-            except Exception as e:
-                logging.warning(f"Could not load language {lang}: {e}")
-
-        if not datasets:
-            return
-
-        dataset = interleave_datasets(datasets)
     else:
+        languages = [l.strip() for l in target_lang.split(',')]
+
+    datasets = []
+    for lang in languages:
         try:
-            dataset = load_dataset(dataset_name, target_lang, split="train", streaming=True)
-            dataset = dataset.map(lambda x: {**x, '_lang': target_lang})
+            ds = load_dataset(dataset_name, lang, split="train", streaming=True)
+            # Tag each language so the engine knows how to compile/run the test harness
+            ds = ds.map(lambda x, l=lang: {**x, '_lang': l})
+            datasets.append(ds)
         except Exception as e:
-            logging.error(f"Could not load language {target_lang}: {e}")
-            return
+            logging.warning(f"Could not load language {lang}: {e}")
+
+    if not datasets:
+        return
+
+    dataset = interleave_datasets(datasets) if len(datasets) > 1 else datasets[0]
 
     dataset = dataset.skip(start_idx)
 
@@ -67,6 +62,7 @@ def train_rl_loop(
     decoder_path: str = "latent_decoder.pth",
     tokenizer_name: str = "Qwen/Qwen2.5-7B-Instruct",
     rl_language: str = "rust",
+    train_steps: int = 82,
 ):
     from src.runtime import get_device, empty_cache, autocast_ctx
     device = get_device()
@@ -136,6 +132,9 @@ def train_rl_loop(
                 starting_step = int(parts[1])
             logging.info(f"Resuming at Epoch {starting_epoch}, Step {starting_step}")
 
+    target_step = starting_step + train_steps
+    logging.info(f"Curriculum Stage initialized. Training for {train_steps} steps (Target: {target_step}).")
+
     for epoch in range(starting_epoch, epochs):
         prompt_generator = stream_rl_prompts(dataset_name=dataset_name, start_idx=starting_step if epoch == starting_epoch else 0, target_lang=rl_language)
 
@@ -143,6 +142,10 @@ def train_rl_loop(
 
         optimizer.zero_grad(set_to_none=True)
         for prompt, test_harness, lang in prompt_generator:
+            if step_idx >= target_step:
+                logging.info(f"🏁 Target steps ({target_step}) reached for this stage. Halting and saving checkpoint.")
+                break
+
             try:
                 inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
@@ -174,6 +177,9 @@ def train_rl_loop(
             except Exception as e:
                 logging.error(f"Error during RL step {step_idx}: {e}")
 
+        if step_idx >= target_step:
+            break
+
     if True:
         raw_model = getattr(model, "_orig_mod", model)
         from src.checkpoint import save_ckpt; save_ckpt(raw_model, "jepa_engine_rl.pth")
@@ -187,5 +193,6 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="bigcode/humanevalpack")
     parser.add_argument("--group_size", type=int, default=4)
     parser.add_argument("--rl_language", type=str, default="rust", help="Specific language split or 'all'")
+    parser.add_argument("--train_steps", type=int, default=82, help="Number of steps to run before halting")
     args = parser.parse_args()
-    train_rl_loop(epochs=args.epochs, dataset_name=args.dataset, group_size=args.group_size, rl_language=args.rl_language)
+    train_rl_loop(epochs=args.epochs, dataset_name=args.dataset, group_size=args.group_size, rl_language=args.rl_language, train_steps=args.train_steps)
